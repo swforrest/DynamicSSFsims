@@ -8,7 +8,7 @@ The R Markdown and accompanying knitted html files are numbered by the order of 
 
 The larger files such as spatial covariates can be found in a Zenodo folder at: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10838069.svg)](https://doi.org/10.5281/zenodo.10838069). In this folder, the `data` folder contains the data used in the first script to generate random steps and sample from the covariates (which are included in the `mapping` folder). All the code should run with just these two sets of inputs (buffalo.csv for GPS data and rasters of spatial covariates in the mapping folder).
 
-The details of the inputs and outputs of each script are below. Creating a project or setting a working directory in the `DynSSF` folder should ensure that all data and files are read in without having to change path names in the scripts.
+The details of the inputs and outputs of each script are below. 
 
 ## Animations of hourly distributions ##
 
