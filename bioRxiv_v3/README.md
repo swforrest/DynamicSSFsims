@@ -1,6 +1,8 @@
 # bioRxiv v3 - Simulating animal movement trajectories from temporally dynamic step selection functions
 
-The code, data and R objects in this repository accompany a paper titled 'Predicting fine-scale distributions and emergent spatiotemporal patterns from temporally dynamic step selection simulations', which is currently available as a preprint at: [https://www.biorxiv.org/content/10.1101/2024.03.19.585696v4](https://www.biorxiv.org/content/10.1101/2024.03.19.585696v4).
+The code, data and R objects in this repository accompany a preprint titled 'Simulating animal movement trajectories from temporally dynamic step selection functions', which is currently available at: [https://www.biorxiv.org/content/10.1101/2024.03.19.585696v3?versioned=true](https://www.biorxiv.org/content/10.1101/2024.03.19.585696v3?versioned=true).
+
+This was a version of the paper prior to being submitted to peer-review. Following peer-review we removed the memory process (through previous space use density) as it wasn't fundamental to our research question, which related to predicting landscape-scale distributions using temporally dynamic simulations. We put these scripts here as the memory process may provide a useful starting point for incorporating memory into SSFs. We were able to recreate home ranging behaviour fairly well, and the simulations produced realistic behaviour.
 
 In this paper we used harmonic terms to estimate temporally dynamic coefficients from step selection models, from which we simulated animal movement trajectories. The simulations with temporal dynamics gave informative hourly predictions of expected buffalo distribution (animations below), and also gave more accurate long-term predictions. 
 
