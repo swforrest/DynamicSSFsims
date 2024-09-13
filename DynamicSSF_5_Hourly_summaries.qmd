@@ -1,0 +1,758 @@
+---
+title: "Hourly summaries of the observed and simulated trajecotries"
+author: "Scott Forrest"
+date: "`r Sys.Date()`"
+execute: 
+  cache: false
+bibliography: references.bib
+toc: true
+number-sections: false
+format: 
+  html:
+    self-contained: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    code-line-numbers: true
+    code-overflow: scroll
+    fig-format: png
+    fig-dpi: 300
+  pdf:
+    geometry: 
+      - top=30mm
+      - left=30mm
+editor:
+  source
+---
+
+```{r setup}
+#| label: img_params
+#| code-summary: "Setting image parameters"
+#| include: false
+
+```
+
+## Load packages
+
+```{r}
+#| label: packages
+#| code-summary: "Load packages"
+#| message: false
+#| warning: false
+
+options(scipen=999)
+
+library(tidyverse)
+packages <- c("amt", "lubridate", "terra", "tictoc", "beepr", "ks", 
+              "adehabitatLT", "adehabitatHR", "ggpubr", "patchwork", "viridis")
+walk(packages, require, character.only = T)
+
+```
+
+## Import the covariate raster layers that were used in the step selection model fitting.
+
+```{r}
+
+# unscaled rasters
+ndvi_stack <- rast("mapping/cropped rasters/ndvi_GEE_projected_watermask20230207.tif")
+ndvi_2018_dry <- ndvi_stack[[8:10]]
+ndvi_2019_dry <- ndvi_stack[[19:21]]
+ndvi_dry <- terra::mean(c(ndvi_2018_dry, ndvi_2019_dry))
+names(ndvi_dry) <- "ndvi_dry"
+# plot(ndvi_dry)
+
+canopy <- rast("mapping/cropped rasters/canopy_cover.tif")
+herby <- rast("mapping/cropped rasters/veg_herby.tif")
+slope <- rast("mapping/cropped rasters/slope_raster.tif")
+
+```
+
+# Load simulated trajectories and extract covariate information
+
+In this script we are only calculating the summaries for the simulations of a single model. To compare the simulations of the other models, we would just change the folder name that we are reading in the csv files from.
+
+We have the trajectories saved in certain folders, so we make a list of all the files in that folder, and then filter them based on the trajectories that we want to select (using the `grep` function to match the strings). Each file will have many trajectories for the starting locations of each of the buffalo (depending on how the simulation was set up). We then read in the csv files. 
+
+```{r message=FALSE}
+
+# read in multiple csv files with similar filenames and bind them together
+sim_data_full_list <- 
+  list.files("Rev1_simulations/no_memory_fit/3p/", 
+             pattern = "*.csv", full.names = T)
+
+sim_data_all <- grep("50ch", sim_data_full_list[1:10], value = T) %>% 
+  grep("3000", x = ., value = T) %>% 
+  map_dfr(read_csv, .id = "file_num") %>% 
+  mutate(file_num = str_remove(file_num, ".csv")) %>% 
+  mutate(file_num = as.numeric(file_num))
+
+# to check the initial locations of the simulated trajectories
+sim_data_all %>% group_by(id) %>% slice(1)
+
+```
+
+## Prepare the simulated data
+
+We need to do a bit of tidying, mostly just so we have a unique ID for each of the simulated trajectories, and then we convert to a track object using the `amt` package and extract covariate values.
+
+```{r}
+
+# create vector of unique ids for subsetting
+sim_data_ids <- unique(sim_data_all$id)
+
+# attach ACST time format
+tz(sim_data_all$t_) <- "Australia/Darwin"
+# subtract a year from the time column so it matches the buffalo data 
+# minus the warmup period (500 hours)
+sim_data_all$t_ <- sim_data_all$t_ - years(1) - days(31)
+
+# convert to track object for step lengths and turning angles etc
+sim_data_all <- sim_data_all %>% mk_track(id = id, x_, y_, t_, all_cols = T, crs = 3112)
+sim_data_all_nested <- sim_data_all %>% arrange(id) %>% nest(data = -"id")
+
+# extract covariate values at the end of the all the simulated steps
+sim_data_all_nested_steps <- sim_data_all_nested %>%
+  
+  mutate(steps = map(data, function(x)
+    x %>% steps(keep_cols = "end") %>% 
+      extract_covariates(ndvi_dry,
+                         where = "end") %>%
+      extract_covariates(canopy,
+                         where = "end") %>%
+      extract_covariates(herby,
+                         where = "end") %>% 
+      extract_covariates(slope,
+                         where = "end")))
+
+# sim_data_all_nested_steps$steps[[1]]
+sim_data_all_steps <- sim_data_all_nested_steps %>% 
+  amt::select(id, steps) %>% 
+  amt::unnest(cols = steps) 
+
+# rearrange the columns so it is id num, sim num, file num then the rest
+sim_data_all_steps <- sim_data_all_steps %>% 
+  # dplyr::select(id, file_num, sim_num, traj, everything()) %>% 
+  mutate(month = month(t1_))
+
+sim_data_all_track <- sim_data_all_steps %>% 
+  mk_track(id = id, x1_, y1_, t1_, order_by_ts = T, all_cols = T, crs = 3112) %>% 
+  arrange(id)
+
+sim_ids <- unique(sim_data_all_steps$id)
+# unique(sim_data_all_steps$file_num)
+
+```
+
+## Split the track into bursts when it crosses to the other side of the landscape
+
+As we had a wrapped landscape in the simulations, we need to split the trajectories into bursts when they go outside the extent and jump to the other side. We also remove any sections that have less than 3 points, and any steps that jump to the other side of the map (determined by steps greater than 10,000m, which is much larger than the largest observed step length).
+
+```{r}
+
+# Identify jumps by checking if the distance is greater than the threshold
+jumps <- which(sim_data_all_steps$sl_ > 5000)
+jumps <- c(1, jumps)
+
+bursts <- rep(NA, nrow(sim_data_all_steps))
+
+for(i in 1:(length(jumps)-1)) {
+  bursts[jumps[i]:jumps[i+1]] <- i
+}
+
+sim_data_all_steps <- sim_data_all_steps %>% mutate(burst = bursts)
+
+# remove any sections that have less than 3 points
+sim_data_all_steps <- sim_data_all_steps %>% 
+  group_by(burst) %>% 
+  filter(n() > 2) %>% 
+  ungroup()
+
+# remove steps that jump to the other side of the map
+sim_data_all_steps <- sim_data_all_steps %>% filter(sl_ < 10000)
+
+burst_ids <- unique(sim_data_all_steps$burst)
+
+sim_data_all_track <- sim_data_all_steps %>% 
+  mk_track(id = id, x1_, y1_, t1_, order_by_ts = T, all_cols = T, crs = 3112) %>% 
+  arrange(id)
+
+```
+
+### Plot some example trajectories (by burst)
+
+```{r}
+
+ggplot() +
+  geom_path(data = sim_data_all_steps %>% filter(burst %in% burst_ids[1:20]),
+            aes(x = x2_, y = y2_, colour = interaction(burst, id)),
+            alpha = 1) +
+  scale_color_viridis_d() +
+  coord_equal() +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+
+# Load observed buffalo data for comparison
+
+```{r}
+
+# importing data, mostly for plotting
+buffalo_data_all <- read_csv("outputs/buffalo_parametric_popn_covs_GvM_10rs_2024-09-04.csv")
+
+buffalo_data_all <- buffalo_data_all %>% 
+  mutate(t1_ = lubridate::with_tz(buffalo_data_all$t1_, tzone = "Australia/Darwin"),
+         t2_ = lubridate::with_tz(buffalo_data_all$t2_, tzone = "Australia/Darwin"))
+
+buffalo_data_all <- buffalo_data_all %>%
+  mutate(id_num = as.numeric(factor(id)), 
+         step_id = step_id_, 
+         x1 = x1_, x2 = x2_, 
+         y1 = y1_, y2 = y2_, 
+         t1 = t1_, 
+         t1_rounded = round_date(t1_, "hour"), 
+         hour_t1 = hour(t1_rounded),
+         t2 = t2_, 
+         t2_rounded = round_date(t2_, "hour"), 
+         hour_t2 = hour(t2_rounded),
+         hour = ifelse(hour_t2 == 0, 24, hour_t2),
+         yday = yday(t1_),
+         year = year(t1_), 
+         month = month(t1_),
+         sl = sl_, 
+         log_sl = log(sl_), 
+         ta = ta_, 
+         cos_ta = cos(ta_),
+         canopy_01 = canopy_cover/100)
+
+# ensure that we have just the individuals that were used for model fitting
+buffalo_year_ids <- c(2005, 2014, 2018, 2021, 2022, 2024, 2039, 
+                      2154, 2158, 2223, 2327, 2387, 2393) 
+buffalo_data_all <- buffalo_data_all %>% filter(id %in% buffalo_year_ids)
+buffalo_data_all <- buffalo_data_all %>% filter(t1 < "2019-07-25 09:32:42 ACST")
+buffalo_ids <- unique(buffalo_data_all$id)
+
+# check the initial location and time for each individual
+buffalo_data_all %>% group_by(id) %>% slice(1)
+# make a dataframe of only the presence locations
+buffalo_data_all_pres <- buffalo_data_all %>% filter(y == 1)
+
+# convert to track object for step lengths and turning angles etc
+buffalo_data_all_pres <- buffalo_data_all_pres %>% 
+  mk_track(id = id, x1_, y1_, t1_, order_by_ts = T, all_cols = T, crs = 3112) %>% 
+  arrange(id) %>% 
+  extract_covariates(ndvi_dry, where = "end")
+
+```
+
+## Subset the buffalo data to the period that simulations were generated for
+
+```{r}
+
+months_wet <- c(1:4, 11:12)
+
+buffalo_data <- buffalo_data_all_pres %>% 
+  filter(!month %in% months_wet & year == 2018) # dry season 2018
+
+buffalo_data_nested <- buffalo_data %>% arrange(id) %>% nest(data = -"id")
+
+```
+
+## Keep the simulated data that lines up with the observed data, for each individual buffalo
+
+As we want the simulated trajectories to cover the same period as the observed data, we filter the simulated data between the minimum and maximum observed times for the buffalo
+
+```{r}
+
+min_btime <- min(buffalo_data$t2_rounded)
+max_btime <- max(buffalo_data$t2_rounded)
+
+sim_data_btime <- sim_data_all_track %>% 
+    filter(t2_ > min_btime & t2_ < max_btime)
+
+```
+
+# Hourly movement behaviour and selection of covariates
+
+Here we bin the trajectories into the hours of the day, and calculate the mean, median (where appropriate) and sd values for the step lengths and four habitat covariates.
+
+We save the results as a csv to compare between all of the models.
+
+## Observed buffalo data
+
+```{r}
+
+buffalo_hourly_habitat <- 
+  buffalo_data %>% dplyr::group_by(hour, id) %>% 
+  summarise(n = n(),
+            step_length_mean = mean(sl_),
+            step_length_median = median(sl_),
+            step_length_sd = sd(sl_),
+            ndvi_mean = mean(ndvi_dry),
+            ndvi_median = median(ndvi_dry),
+            ndvi_sd = sd(ndvi_dry),
+            herby_mean = mean(veg_herby),
+            herby_sd = sd(veg_herby),
+            canopy_mean = mean(canopy_cover/100),
+            canopy_sd = sd(canopy_cover/100),
+            slope_mean = mean(slope),
+            slope_median = median(slope),
+            slope_sd = sd(slope)
+            ) %>% ungroup()
+
+buffalo_hourly_habitat <- data.frame("data" = "buffalo", buffalo_hourly_habitat) %>% 
+  mutate(id = as.factor(id))
+
+# write the summaries to a csv
+# write.csv(buffalo_hourly_habitat,
+#           paste0("outputs/buffalo_summaries_hourly_habitat.csv"))
+
+buffalo_hourly_habitat_long <- buffalo_hourly_habitat %>%
+  pivot_longer(cols = !c(data, hour, id), names_to = "variable", values_to = "value")
+
+sim_hourly_habitat <-
+  sim_data_btime %>% dplyr::group_by(hour, id) %>%
+  summarise(n = n(),
+            step_length_mean = mean(sl_),
+            step_length_median = median(sl_),
+            step_length_sd = sd(sl_),
+            ndvi_mean = mean(ndvi_dry),
+            ndvi_median = median(ndvi_dry),
+            ndvi_sd = sd(ndvi_dry),
+            herby_mean = mean(veg_herby),
+            herby_sd = sd(veg_herby),
+            canopy_mean = mean(canopy_cover/100),
+            canopy_sd = sd(canopy_cover/100),
+            slope_mean = mean(slope_raster),
+            slope_median = median(slope_raster),
+            slope_sd = sd(slope_raster)
+            ) %>% ungroup()
+
+# change the model name accordingly
+sim_hourly_habitat <- data.frame("data" = "3p", sim_hourly_habitat) %>%
+  rename(id = id) %>% mutate(id = as.factor(id))
+
+# save the summaries - change the model name accordingly
+# write.csv(sim_hourly_habitat,
+#           paste0("outputs/sim_3p_summaries_hourly_habitat.csv"))
+
+sim_hourly_habitat_long <- sim_hourly_habitat %>%
+  pivot_longer(cols = !c(data, hour, id), names_to = "variable", values_to = "value")
+
+# combine the dataframe
+hourly_habitat_long <- bind_rows(buffalo_hourly_habitat_long, sim_hourly_habitat_long)
+
+```
+
+# Comparing hourly summary statistics
+
+Import the summary statistic data frames from the observed and simulated datasets that were outputted by the trajectory validation scripts, and combine into a single data frame for plotting
+
+```{r message = FALSE}
+
+# read in the observed data
+summaries_hourly_buffalo <- 
+  read_csv("outputs/buffalo_summaries_hourly_habitat.csv") %>% 
+  mutate(id = as.factor(id))
+
+# read in the simulated data
+summaries_hourly_0p <- 
+  read_csv("outputs/sim_0p_summaries_hourly_habitat.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_1p <- 
+  read_csv("outputs/sim_1p_summaries_hourly_habitat.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_2p <- 
+  read_csv("outputs/sim_2p_summaries_hourly_habitat.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_3p <- 
+  read_csv("outputs/sim_3p_summaries_hourly_habitat.csv") %>% 
+  mutate(id = as.factor(id))
+
+summaries_hourly_all <- bind_rows(summaries_hourly_buffalo, 
+                                  summaries_hourly_0p, 
+                                  summaries_hourly_1p, 
+                                  summaries_hourly_2p, 
+                                  summaries_hourly_3p)
+
+summaries_hourly_all_long <- summaries_hourly_all %>% 
+  dplyr::select(!...1) %>% 
+  pivot_longer(cols = !c(data, hour, id), 
+               names_to = "variable", 
+               values_to = "value") %>% 
+  mutate(Data = factor(str_to_title(data), 
+                       levels = c("Buffalo", "0p", "1p", "2p", "3p")))
+
+head(summaries_hourly_all)
+head(summaries_hourly_all_long)
+
+```
+
+## Plot the hourly habitat selection between the observed and simulated data from different models
+
+In these plots we are assessing how well the simulated trajectories capture the movement dynamics and habitat use of the observed data.
+
+To express the stochasticity of the simulations, here we show the 25th to 50th quantiles and the 2.5th to 97.5th quantiles of the data. Remember that the 'data' are the means for each hour for each trajectory, so the quantiles are calculated across the means for each hour.
+
+Here we create a ribbon from the 25th to 50th quantiles and from the 2.5th to 97.5th quantiles of the data
+
+```{r}
+
+hourly_summary_quantiles <- summaries_hourly_all_long %>% 
+  dplyr::group_by(Data, hour, variable) %>% 
+  summarise(n = n(), 
+            mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            q025 = quantile(value, probs = 0.025, na.rm = TRUE), 
+            q25 = quantile(value, probs = 0.25, na.rm = TRUE),
+            q50 = quantile(value, probs = 0.5, na.rm = TRUE), 
+            q75 = quantile(value, probs = 0.75, na.rm = TRUE),
+            q975 = quantile(value, probs = 0.975, na.rm = TRUE))
+
+```
+
+Here we show the hourly step length and selection of three of the habitat covariates. We use a dashed-line ribbon for the 95% interval and a solid-line ribbon for the 50% interval. We show the mean as a solid line.
+
+## Set plotting parameters
+
+```{r}
+
+# set plotting parameters here that will change in each plot
+buff_path_alpha <- 0.1
+ribbon_95_alpha <- 0.1
+ribbon_50_alpha <- 0.15
+path_95_alpha <- 1
+
+# set path alpha
+buff_path_alpha <- 0.25
+
+# linewidth
+buff_path_linewidth <- 0.5
+
+# Create color mapping
+unique_groups <- unique(summaries_hourly_all_long$Data)
+colors <- viridis(length(unique_groups))
+names(colors) <- unique_groups
+colors["Buffalo"] <- "red"
+
+```
+
+
+::: {.panel-tabset}
+
+## Step lengths
+
+```{r}
+
+hourly_path_sl_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long %>% 
+              filter(Data == "Buffalo" & variable == "step_length_mean"),
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)),
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Step length (m)") +
+  theme_classic()
+
+hourly_path_sl_plot
+
+```
+
+## NDVI
+
+```{r}
+  
+hourly_path_ndvi_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long %>% 
+              filter(Data == "Buffalo" & variable == "ndvi_mean"),
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)),
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("NDVI") +
+  theme_classic()
+
+hourly_path_ndvi_plot
+    
+```
+
+## Herbaceous vegetation
+
+```{r}
+
+hourly_path_herby_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long %>% 
+              filter(Data == "Buffalo" & variable == "herby_mean"), 
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Herbaceous vegetation") +
+  theme_classic()
+
+hourly_path_herby_plot
+    
+```
+
+## Canopy cover
+
+```{r}
+
+hourly_path_canopy_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long %>% 
+              filter(Data == "Buffalo" & variable == "canopy_mean"), 
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Canopy cover") +
+  theme_classic()
+
+hourly_path_canopy_plot
+
+```
+
+## Slope
+
+```{r}
+
+hourly_path_slope_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long %>% 
+              filter(Data == "Buffalo" & variable == "slope_mean"), 
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "slope_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Slope") +
+  theme_classic()
+
+hourly_path_slope_plot
+
+```
+::: 
+
+# Combining the hourly plots
+
+```{r}
+
+ggarrange(hourly_path_sl_plot + 
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank()), 
+          
+          hourly_path_ndvi_plot + 
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank(),
+                  axis.title.y = element_blank()), 
+          
+          hourly_path_herby_plot, 
+          
+          hourly_path_canopy_plot +
+            theme(axis.title.y = element_blank()),
+          
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow = 2,
+          legend = "bottom",
+          common.legend = TRUE)
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/hourly_path_mean_all_", 
+#               Sys.Date(), ".png"),
+#        width=150, height=120, units="mm", dpi = 600)
+
+```
+
+## References
+
+<div id="refs"></div> 
+  
+## Session info
+
+```{r}
+
+sessionInfo()
+
+```

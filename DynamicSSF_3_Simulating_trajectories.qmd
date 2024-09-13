@@ -1,0 +1,588 @@
+---
+title: "Step selection simulations"
+subtitle: "Generating simulations from a fitted (temporally dynamic) step selection function"
+author: "Scott Forrest"
+date: "`r Sys.Date()`"
+execute: 
+  cache: false
+bibliography: references.bib
+toc: true
+number-sections: false
+format: 
+  html:
+    self-contained: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    code-line-numbers: true
+    code-overflow: scroll
+  pdf:
+    geometry: 
+      - top=30mm
+      - left=30mm
+editor:
+  source
+---
+  
+In this script we simulate trajectories from a temporally dynamic step selection function (SSF) fitted to GPS data. The model fitting is done in a separate script, as well as the construction of the temporally varying coefficients from the harmonic terms.
+
+```{r setup}
+#| label: img_params
+#| code-summary: "Setting image parameters"
+#| include: false
+
+knitr::opts_chunk$set(echo = TRUE,
+                      dev = 'png',
+                      dpi = 300)
+
+```
+
+## Load packages
+
+```{r}
+#| label: packages
+#| code-summary: "Load packages"
+#| message: false
+#| warning: false
+
+options(scipen=999)
+
+library(tidyverse)
+packages <- c("amt", "lubridate", "terra", "tictoc", 
+              "beepr", "matrixStats", "Rfast")
+walk(packages, require, character.only = T)
+
+```
+
+## Import temporally dynamic coefficients
+
+Load a table of temporally varying coefficients (reconstructed from the harmonic terms) from the model fitting script, `DynamicSSF_2a_Model_fit_dry_season`. This has coefficients at 0.1 hour increments, but we are simulating steps at 1 hourly intervals, so we will subset to retain coefficients at 1 hourly intervals.
+
+As an example, we are using the coefficients from the model with two pairs of harmonics. To use coefficients from a different model, the only change in the script should be the table of coefficients, which contains the temporally dynamic movement parameters.
+
+These coefficients should be on the *natural* scale, as they will be multiplied by the habitat covariates in their natural scales. 
+
+Select which model coefficients to use
+
+```{r}
+
+# model_no <- "0p"
+# model_no <- "1p"
+model_no <- "2p"
+# model_no <- "3p"
+
+```
+
+Read in the hourly coefficients
+
+```{r}
+
+#Load coefficient estimates from the model fitting script
+hourly_coefs <- read_csv(paste0("outputs/TwoStep_", model_no, "Daily_coefs_dry_2024-09-04.csv"))
+head(hourly_coefs)
+
+# lengthen data frame for ggplot
+hourly_coefs_long <- hourly_coefs %>% pivot_longer(cols = !hour)
+
+```
+
+Plot the temporally varying coefficients to check whether everything looks as it should.
+
+```{r}
+
+ggplot() +
+geom_line(data = hourly_coefs_long %>% filter(!name == "scale"),
+          aes(x = hour, y = value, colour = factor(name))) +
+  # transform the scale parameter by 1/600 for plotting on a similar scale 
+  # to the other parameters (only for plotting)
+  geom_line(data = hourly_coefs_long %>% filter(name == "scale"),
+          aes(x = hour, y = value/600, colour = factor(name))) +
+scale_colour_viridis_d("Covariate") +
+geom_hline(yintercept = 0, linetype = "dashed") +
+scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+theme_classic()
+
+```
+
+Subset to retain coefficients at 1 hourly intervals, which is the scale our coefficients were estimated on, and that which we will be predicting with. We'll also set hour 0 to be hour 24 (as they are the same thing) so we can index from 1.
+
+```{r}
+
+# keep only the integer hours using the modulo operator
+hourly_coefs <- hourly_coefs %>% filter(hourly_coefs$hour %% 1 == 0) %>% 
+  # change the 0th hour to 24
+  mutate(hour = ifelse(hour == 0, 24, hour))
+
+head(hourly_coefs)
+
+# lengthen data frame for ggplot
+hourly_coefs_long <- hourly_coefs %>% pivot_longer(cols = !hour)
+
+```
+
+Agai, plot the temporally varying coefficients to check whether the subsetting worked correctly.
+
+```{r}
+
+ggplot() +
+geom_line(data = hourly_coefs_long %>% filter(!name == "scale"),
+          aes(x = hour, y = value, colour = factor(name))) +
+  # transform the scale parameter by 1/600 for plotting on a similar scale 
+  # to the other parameters (only for plotting)
+  geom_line(data = hourly_coefs_long %>% filter(name == "scale"),
+          aes(x = hour, y = value/600, colour = factor(name))) +
+scale_colour_viridis_d("Covariate") +
+geom_hline(yintercept = 0, linetype = "dashed") +
+scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+theme_classic()
+
+```
+
+## Import environmental layers
+
+```{r}
+
+# unscaled rasters
+ndvi_stack <- rast("mapping/cropped rasters/ndvi_GEE_projected_watermask20230207.tif")
+canopy_cover <- rast("mapping/cropped rasters/canopy_cover.tif")
+veg_herby <- rast("mapping/cropped rasters/veg_herby.tif")
+slope <- rast("mapping/cropped rasters/slope_raster.tif")
+
+```
+
+As we fitted either wet or dry season models to data that covered 2018 and 2019, we will use the mean of the NDVI for the parts of the 2018 and 2019 dry season that we want to simulate over, which is the late dry season (August to October).
+
+```{r}
+
+ndvi_2018_late_dry <- ndvi_stack[[8:10]]
+ndvi_2019_late_dry <- ndvi_stack[[19:21]]
+ndvi_late_dry <- terra::mean(c(ndvi_2018_late_dry, ndvi_2019_late_dry))
+names(ndvi_late_dry) <- "NDVI"
+
+```
+
+## Subsetting environmental layers
+
+As much of the environmental layers do not contain observed buffalo GPS locations, we crop a smaller extent to generate simulations over, which will then require fewer simulations. We determined this extent as it has a high density of observed buffalo locations.
+
+```{r}
+
+# subset raster
+template_raster_crop <- terra::rast(xmin = 20000, 
+                                    xmax = 40000, 
+                                    ymin = -1445000, 
+                                    ymax = -1425000, 
+                                    resolution = 25, 
+                                    crs = "epsg:3112")
+
+```
+
+## Crop the rasters
+
+```{r}
+
+ndvi_late_dry_cropped <- terra::crop(ndvi_late_dry, template_raster_crop)
+canopy_cover_cropped <- terra::crop(canopy_cover, template_raster_crop)
+veg_herby_cropped <- terra::crop(veg_herby, template_raster_crop)
+slope_cropped <- terra::crop(slope, template_raster_crop)
+
+# plot the cropped rasters
+plot(ndvi_late_dry_cropped)
+plot(canopy_cover_cropped)
+plot(veg_herby_cropped)
+plot(slope_cropped)
+
+# for plotting with ggplot after generating simulations
+ndvi_late_dry_cropped_df <- as.data.frame(ndvi_late_dry_cropped, xy = TRUE)
+ndvi_late_dry_cropped_df$NDVI_discrete <- cut(ndvi_late_dry_cropped_df$NDVI, 
+                                      breaks=9, dig.lab = 2)
+
+```
+
+We will also square NDVI and canopy cover now, and then it's just a multiplication with the temporally varying coefficient within the function.
+
+```{r}
+
+# NDVI squared
+ndvi_late_dry_cropped_sq <- ndvi_late_dry_cropped ^ 2
+
+# rescale canopy cover to 0 - 1 (as this was what the model was fitted to)
+canopy01_cropped <- canopy_cover_cropped/100
+# canopy cover squared
+canopy01_cropped_sq <- canopy01_cropped ^ 2
+
+```
+
+
+# Generating predictions
+
+## Resource selection function
+
+The habitat selection term of a step selection function is typically modelled analogously to a resource-selection function (RSF), that assumes an exponential (log-linear) form as
+
+$$
+    \omega(\mathbf{X}(s_t); \boldsymbol{\beta}(\tau; \boldsymbol{\alpha})) = \exp(\beta_{1}(\tau; \boldsymbol{\alpha}_1) X_1(s_t) + \cdots + \beta_{n}(\tau; \boldsymbol{\alpha}_n) X_n(s_t)),
+$$
+
+where $\boldsymbol{\beta}(\tau; \boldsymbol{\alpha}) = (\beta_{1}(\tau; \boldsymbol{\alpha}_1), \ldots, \beta_{n}(\tau; \boldsymbol{\alpha}_n))$ in our case, 
+
+$$
+\beta_i(\tau; \boldsymbol{\alpha}_i) = \alpha_{i,0} + \sum_{j = 1}^P \alpha_{i,j} \sin \left(\frac{2j \pi \tau}{T} \right) + \sum_{j = 1}^P \alpha_{i,j + P} \cos \left(\frac{2j \pi \tau}{T} \right),
+$$
+
+and $\boldsymbol{\alpha}_i = (\alpha_{i, 0}, \dots, \alpha_{i, 2P})$, where $P$ is the number of pairs of harmonics, e.g. for $P = 2$, for each covariate there would be two sine terms and two cosine terms, as well as the linear term denoted by $\alpha_{i, 0}$. The $+ P$ term in the $\alpha$ index of the cosine term ensures that each $\alpha_i$ coefficient in $\boldsymbol{\alpha}_i$ is unique.
+
+To aid the computation of the simulations, we can precompute $\omega(\mathbf{X}(s_t); \boldsymbol{\beta}(\tau; \boldsymbol{\alpha}))$ for each hour prior to running the simulations.
+
+In the dataframe of temporally varying coefficients, for each covariate we have reconstructed $\beta_{i}(\tau; \boldsymbol{\alpha}_i)$ and discretised for each hour of the day, resulting in $\beta_{i,\tau}$ for $i = 1, \ldots, n$ where $n$ is the number of covariates and $\tau = 1, \ldots, 24$. 
+
+Given these, we can solve $\omega(\mathbf{X}(s_t); \boldsymbol{\beta}(\tau; \boldsymbol{\alpha}))$ for every hour of the day. This will result in an RSF map for each hour of the day, which we will use in the simulations.
+
+Then, when we do our step selection simulations, we can just subset these maps by the current hour of the day, and extract the values of $\omega(\mathbf{X}(s_t); \boldsymbol{\beta}(\tau; \boldsymbol{\alpha}))$ for each proposed step location, rather than solving $\omega(\mathbf{X}(s_t); \boldsymbol{\beta}(\tau; \boldsymbol{\alpha}))$ for every step location.
+
+### Calculating the RSF layers
+
+```{r}
+
+# creaty empty objects to store the layers
+rsf_pred_stack <- c()
+
+tic("RSF predictions") 
+
+# for each hour of the day
+for(hour_no in 1:24) {
+
+  # create a raster stack of the covariates (including the squared terms)
+  resources <- c(ndvi_late_dry_cropped,
+                 ndvi_late_dry_cropped_sq,
+                 canopy01_cropped,
+                 canopy01_cropped_sq,
+                 slope_cropped,
+                 veg_herby_cropped
+                 )
+  # ndvi
+  # using the linear term
+  ndvi_late_dry_lin <- resources[[1]] * 
+    hourly_coefs$ndvi[[which(hourly_coefs$hour == hour_no)]]
+  # using the quadratic term
+  ndvi_late_dry_quad <- resources[[2]] * 
+    hourly_coefs$ndvi_2[[which(hourly_coefs$hour == hour_no)]]
+  # combining
+  ndvi_late_dry_pred <- ndvi_late_dry_lin + ndvi_late_dry_quad
+  
+  # canopy cover 
+  # using the linear term
+  canopy_lin <- resources[[3]] * 
+    hourly_coefs$canopy[[which(hourly_coefs$hour == hour_no)]]
+  # using the quadratic term
+  canopy_quad <- resources[[4]] * 
+    hourly_coefs$canopy_2[[which(hourly_coefs$hour == hour_no)]]
+  # combining
+  canopy_pred <- canopy_lin + canopy_quad
+  
+  # veg_herby
+  slope_lin <- resources[[5]]
+  slope_pred <- slope_lin * 
+    hourly_coefs$slope[[which(hourly_coefs$hour == hour_no)]]
+  
+  # veg_herby
+  veg_herby_lin <- resources[[6]]
+  veg_herby_pred <- veg_herby_lin * 
+    hourly_coefs$herby[[which(hourly_coefs$hour == hour_no)]]
+  
+  # combining all covariates (but not exponentiating yet)
+  rsf_pred <- ndvi_late_dry_pred + canopy_pred + slope_pred + veg_herby_pred
+  
+  # adding to the list of rasters for each hour
+  rsf_pred_stack <- c(rsf_pred_stack, rsf_pred)
+
+}
+
+toc()
+beep(sound = 2)
+
+```
+
+We now have a stack of RSF predictions for each hour of the day, which we will simulate the movement process over, and in our case use to predict expected buffalo distribution. 
+
+## Plot some example RSF predictions
+
+```{r}
+
+plot(rsf_pred_stack[[3]], main = "RSF predictions - Hour 3")
+plot(rsf_pred_stack[[12]], main = "RSF predictions - Hour 12")
+
+```
+
+## Setting the origin
+
+If using a 'wrapped' or 'toroid' boundary, then the origin should be set to (0,0) as we'll use the modulo operator (which is `%%` in R) to do the wrapping. We will set it back to it's original coordinates after running the simulations. To be consistent we will just always set the origin to (0,0).
+
+```{r}
+
+# convert the list of rsf prediction rasters to a raster stack
+rsf_predictions <- rast(rsf_pred_stack)
+# set the time of the RSF rasters - here we are only interested in the hour,
+# so we just set an arbitrary date. Although if predicting over seasons for
+# instance, then set the date with the correct increment
+terra::time(rsf_predictions) <- ymd_hm("2018-08-01 00:00", 
+                                       tz = "Australia/Queensland") + hours(1:24)
+
+terra::time(rsf_predictions)
+hour(time(rsf_predictions))
+
+# get the extent coordinates of the RSF predictions
+xmin <- ext(rsf_predictions)[1]
+xmax <- ext(rsf_predictions)[2]
+ymin <- ext(rsf_predictions)[3]
+ymax <- ext(rsf_predictions)[4]
+crop_extent <- ext(xmin, xmax, ymin, ymax)
+
+# set the origin at (0,0)
+ext(rsf_predictions) <- c(xmin - xmin, xmax - xmin, 
+                                    ymin - ymin, ymax - ymin)
+
+```
+
+# Simulation function
+
+There are several parts to the memory process as it needs to 'warm-up' so there are enough locations to start using as the memory. This part of the trajectory is then discarded.
+
+```{r}
+  
+simulate_ssf <- function(
+    n_steps,  # final number of steps in the trajectory
+    n_ch,  # number of proposed steps at each time point
+    coef, # table of temporally varying coefficient values
+    xy0, # starting location
+    resc, # resources - rsf predictions
+    boundary = "wrapped" # boundary type (either "wrapped" or "reflective")
+    ) {
+
+  tic()
+  
+  # step length samples for each hour
+  # iterating over hourly coef values
+  sl <- rgamma(n_steps * n_ch, 
+               shape = rep(coef$shape, each = n_ch), 
+               scale = rep(coef$scale, each = n_ch))
+  # hist(log(sl), breaks = 100) # for checking the distribution of step lengths
+
+  # turning angle samples for each hour
+  # create a vector of the coefficients
+  ta_coefs <- rep(coef$kappa, each = n_ch, length.out = n_steps)
+  # if positive, mean = 0 (which is rvonmises(mu = pi) - pi), 
+  # indicating persistent steps in a similar direction,
+  # otherwise mean = pi (which is rvonmises(mu = 0) - pi), 
+  # indicating reversal steps
+  ta_coefs_mu <- ifelse(ta_coefs > 0, pi, 0)
+  # sample turning angles
+  ta <- as.vector(mapply(Rfast::rvonmises, 
+                         n = n_ch, 
+                         m = ta_coefs_mu, 
+                         k = abs(ta_coefs))) - pi
+  # hist(ta, breaks = 100)
+
+  # setup the simulation
+  steps <- rep(1:n_steps, each = n_ch)
+  hour <- rep(1:24, each = n_ch, length.out = n_steps*n_ch)
+
+  x_0 <- xy0[[1]]
+  y_0 <- xy0[[2]]
+  angle_0 <- runif(1, min = -pi, max = pi)
+
+  x <- rep(NA, n_steps)
+  y <- rep(NA, n_steps)
+  step_length <- rep(NA, n_steps)
+  angle <- rep(NA, n_steps)
+  bearing <- rep(NA, n_steps)
+  hab_p <- rep(NA, n_steps)
+
+  x[1] <- x_0
+  y[1] <- y_0
+  step_length[1] <- 0
+  angle[1] <- angle_0
+  bearing[1] <- 0
+  hab_p[1] <- 0
+
+  for (i in 2:n_steps) {
+
+    # i = 2 # for testing the function - start at i = 2
+
+    if(boundary == "wrapped") {
+      
+      
+      # wrapped boundary
+      # adding the modulo operator %% ensures a wrapped/toroid landscape, 
+      # but the origin must be at (0,0)
+      
+      x_prop <- (x[i - 1] + sl[steps == i] * 
+                   cos(bearing[i - 1] + ta[steps == i])) %% ext(resc)[2]
+      
+      y_prop <- (y[i - 1] + sl[steps == i] * 
+                   sin(bearing[i - 1] + ta[steps == i])) %% ext(resc)[4]
+  
+      } else if(boundary == "reflective") {
+        
+        # reflective boundary 
+        # values outside the extent will be discarded when sampling from 
+        # proposed steps
+        
+        x_prop <- (x[i - 1] + sl[steps == i] * 
+                     cos(bearing[i - 1] + ta[steps == i]))
+        
+        y_prop <- (y[i - 1] + sl[steps == i] * 
+                     sin(bearing[i - 1] + ta[steps == i]))
+  
+      } else {
+        print(paste0("Specify either 'reflective' (hard boundary) or, 
+              'wrapped' (toroidal) for the boundary"))
+      }
+      
+      sl_prop <- sl[steps == i]
+      angle_prop <- ta[steps == i]
+      bearing_prop <- atan2(y_prop - y[i - 1], x_prop - x[i - 1])
+      hour_prop <- ifelse(i %% 24 == 0, 24, i %% 24)
+  
+      # sampling environment
+      p <- terra::extract(resc[[hour_prop]], cbind(x_prop, y_prop))[,1]
+  
+      # set any NAs to very low weights
+      p[is.na(p)] <- -50
+  
+      # probabilisitically choose the next step based on the 
+      # habitat probability weights, which are the RSF values
+      w <- sample(n_ch, 1, prob = exp(p))
+      
+      # store values in vectors to turn into a dataframe
+      x[i] <- x_prop[w]
+      y[i] <- y_prop[w]
+      step_length[i] <- sl_prop[w]
+      angle[i] <- angle_prop[w]
+      bearing[i] <- bearing_prop[w]
+      hab_p[i] <- p[w]
+
+  }
+  (toc())
+  return(data_frame(x = x, 
+                    y = y, 
+                    sl = step_length, 
+                    angle = angle, 
+                    bearing = bearing, 
+                    hab_p = hab_p))
+}
+
+```
+
+## Setup starting locations
+
+```{r}
+
+# random starting locations
+n_start_locs <- 1e6
+start_x <- runif(n_start_locs, xmin, xmax)
+start_y <- runif(n_start_locs, ymin, ymax)
+start_locs <- matrix(c(start_x - xmin, 
+                       start_y - ymin), 
+                     ncol = 2, nrow = n_start_locs)
+
+# centre location
+centre_x <- (xmin + xmax) / 2
+centre_y <- (ymin + ymax) / 2
+centre_loc <- matrix(c(centre_x - xmin, 
+                       centre_y - ymin), 
+                     ncol = 2, nrow = 1)
+
+```
+
+# Simulating trajectories
+
+For this example we will just simulate a few trajectories to illustrate the process. For the paper we used this script in a High Performance Computing (HPC) cluster to simulate 100,000 trajectories of 3,000 steps each, for each model (set of estimated coefficients).
+
+Here we use a reflective boundary as it's nicer for plotting (trajectories don't jump to the other side), but for the manuscript we used the wrapped boundary. 
+
+```{r}
+
+n_indvs <- 5 # number of individual trajectories
+n_steps <- 500 # number of steps in the trajectory
+n_ch <- 50 # number of proposed steps to be selected from
+
+tic()
+  
+stps_list <- map(1:n_indvs, function(i) 
+  simulate_ssf(n_steps = n_steps,
+               n_ch = n_ch,
+               coef = hourly_coefs,
+               # xy0 = start_locs[i,],
+               xy0 = centre_loc,
+               resc = rsf_predictions,
+               boundary = "reflective"
+               )
+  )
+
+
+toc()
+
+sims_nested <- data_frame(
+  id = paste0(model_no, "_sims_sim", 1:n_indvs),
+  track = map(stps_list, 
+              ~ amt::track(x = .$x, 
+                           y = .$y, 
+                           t = ymd_hm("2019-08-01 00:00") + 
+                             hours(1:nrow(.)), 
+                           angle = .$angle, 
+                           bearing = .$bearing, 
+                           hab_p = .$hab_p)
+              )
+  )
+
+sims_data <- unnest(sims_nested, cols = track)
+sims_data$hour <- ifelse(hour(sims_data$t_) == 0, 24, hour(sims_data$t_))
+sim_data_truexy <- sims_data %>% mutate(x_ = x_ + xmin, y_ = y_ + ymin)
+
+```
+
+## Plot the simulations
+
+```{r}
+
+ggplot() +
+  geom_raster(data = ndvi_late_dry_cropped_df, 
+              aes(x = x, y = y, fill = NDVI_discrete), 
+              alpha = 0.5) +
+  geom_point(data = sim_data_truexy, 
+             aes(x = x_, y = y_, colour = id), 
+             size = 0.75, alpha = 0.1) +
+  geom_path(data = sim_data_truexy,
+            aes(x = x_, y = y_, colour = id),
+            alpha = 0.75) +
+  scale_fill_brewer(palette = "Greens") +
+  scale_color_viridis_d("Sim ID") +
+  coord_equal() +
+  theme_classic() +
+  theme(legend.position = "none")
+
+```
+
+## Save the simulated trajectories
+
+```{r}
+
+filename <- paste0("model_", model_no, "_20kmx20km_runif_", n_indvs, "ind_", n_ch, "ch_", n_steps, "stp_", Sys.Date(), ".csv")
+print(filename)
+# write_csv(sim_data_mem_truexy, filename)
+
+```
+
+## References
+
+::: {#refs}
+:::
+  
+## Session info
+
+```{r}
+
+sessionInfo()
+
+```

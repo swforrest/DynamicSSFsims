@@ -1,0 +1,2806 @@
+---
+title: "Fitting models to the buffalo data"
+subtitle: "Dynamic step selection functions with temporal harmonics - wet season"
+author: "Scott Forrest"
+date: "`r Sys.Date()`"
+execute: 
+  cache: false
+bibliography: references.bib
+toc: true
+format: 
+  html:
+    self-contained: true
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    code-line-numbers: true
+    code-overflow: scroll
+  pdf:
+    geometry: 
+      - top=30mm
+      - left=30mm
+editor:
+  source
+---
+
+```{r}
+#| label: img_params
+#| code-summary: "Setting image parameters"
+#| include: false
+
+knitr::opts_chunk$set(echo = TRUE,
+                      dev = 'png',
+                      dpi = 300)
+
+```
+
+## Load packages
+
+```{r }
+#| label: packages
+#| code-summary: "Loading packages"
+#| message: false
+#| warning: false
+
+options(scipen=999)
+
+library(tidyverse)
+packages <- c("lubridate", "survival", "terra", "tictoc", 
+              "TwoStepCLogit", "ecospat", "beepr", "clogitL1", 
+              "ggpubr", "MASS", "patchwork", "glmmTMB", "sjPlot", "scales",
+              "formatR")
+walk(packages, require, character.only = T)
+
+```
+
+## Importing buffalo data
+
+Import the buffalo data with random steps and extracted covariates that we created in the previous script: `Ecography_DynamicSSF_1_Step_generation`.
+
+Here we create the sine and cosine terms that were interact with each of the covariates to fit temporally varying parameters.
+
+```{r}
+#| label: import_data
+#| code-summary: "Importing data"
+
+buffalo_data_all <- read_csv("outputs/buffalo_parametric_popn_covs_GvM_10rs_2024-09-04.csv")
+
+buffalo_data_all <- buffalo_data_all %>%
+  mutate(t1_ = lubridate::with_tz(buffalo_data_all$t1_, tzone = "Australia/Darwin"),
+         t2_ = lubridate::with_tz(buffalo_data_all$t2_, tzone = "Australia/Darwin"))
+
+buffalo_data_all <- buffalo_data_all %>%
+  mutate(id_num = as.numeric(factor(id)),
+         step_id = step_id_,
+         x1 = x1_, x2 = x2_,
+         y1 = y1_, y2 = y2_,
+         t1 = t1_,
+         t1_rounded = round_date(buffalo_data_all$t1_, "hour"),
+         hour_t1 = hour(t1_rounded),
+         t2 = t2_,
+         t2_rounded = round_date(buffalo_data_all$t2_, "hour"),
+         hour_t2 = hour(t2_rounded),
+         hour = hour_t2,
+         yday = yday(t1_),
+         year = year(t1_),
+         month = month(t1_),
+         sl = sl_,
+         log_sl = log(sl_),
+         ta = ta_,
+         cos_ta = cos(ta_),
+         # scale canopy cover from 0 to 1
+         canopy_01 = canopy_cover/100,
+         # here we create the harmonic terms for the hour of the day
+         # for seasonal effects, change hour to yday (which is tau in the manuscript), 
+         # and 24 to 365 (which is T)
+         hour_s1 = sin(2*pi*hour/24),
+         hour_s2 = sin(4*pi*hour/24),
+         hour_s3 = sin(6*pi*hour/24),
+         hour_c1 = cos(2*pi*hour/24),
+         hour_c2 = cos(4*pi*hour/24),
+         hour_c3 = cos(6*pi*hour/24))
+
+# to select a single year of data
+buffalo_data_all <- buffalo_data_all %>% filter(t1 < "2019-07-25 09:32:42 ACST")
+
+buffalo_ids <- unique(buffalo_data_all$id)
+
+# Timeline of buffalo data
+buffalo_data_all %>% ggplot(aes(x = t1, y = factor(id), colour = factor(id))) +
+  geom_point(alpha = 0.1) +
+  scale_y_discrete("Buffalo ID") +
+  scale_x_datetime("Date") +
+  scale_colour_viridis_d() +
+  theme_bw() +
+  theme(legend.position = "none")
+
+```
+
+# Fitting the models
+
+## Creating a data matrix
+
+First we create a data matrix to be provided to the model, and then we scale and centre the full data matrix, with respect to each of the columns. That means that all variables are scaled and centred *after* the data has been split into wet and dry season data, and also after creating the quadratic and harmonic terms (when using them).
+
+We should only include covariates in the data matrix that will be used in the model formula.
+
+**Models**
+
+-   0p = 0 pairs of harmonics
+-   1p = 1 pair of harmonics
+-   2p = 2 pairs of harmonics
+-   3p = 3 pairs of harmonics
+
+For the dynamic models, we start to add the harmonic terms. As we have already created the harmonic terms for the hour of the day (s1, c1, s2, etc), we just interact (multiply) these with each of the covariates, including the quadratic terms, prior to model fitting. We store the scaling and centering variables to reconstruct the natural scale coefficients.
+
+To provide some intuition about harmonic regression we have created a walkthrough script `Ecography_DynamicSSF_Walkthrough_Harmonics_and_selection_surfaces` that introduces harmonics and how they can be used to model temporal variation in the data. It will help provide some understand the model outputs and how we construct the temporally varying coefficients in this script.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_data_matrix
+
+months_wet <- c(1:4, 11:12)
+buffalo_ids <- unique(buffalo_data_all$id)
+
+# comment and uncomment the relevant lines to get either wet or dry season data
+buffalo_data <- buffalo_data_all %>% filter(month %in% months_wet) # wet season
+# buffalo_data <- buffalo_data_all %>% filter(!month %in% months_wet) # dry season
+
+buffalo_data_matrix_unscaled <- buffalo_data %>% transmute(
+  
+  ndvi = ndvi_temporal,
+  ndvi_sq = ndvi_temporal ^ 2,
+  canopy = canopy_01,
+  canopy_sq = canopy_01 ^ 2,
+  slope = slope,
+  herby = veg_herby,
+  step_l = sl,
+  log_step_l = log_sl,
+  cos_turn_a = cos_ta)
+
+buffalo_data_matrix_scaled <- scale(buffalo_data_matrix_unscaled)
+
+# save the scaling values to recover the natural scale of the coefficients
+# which is required for the simulations 
+# (so then environmental variables don't need to be scaled)
+mean_vals <- attr(buffalo_data_matrix_scaled, "scaled:center")
+sd_vals <- attr(buffalo_data_matrix_scaled, "scaled:scale")
+scaling_attributes_0p <- data.frame(variable = names(buffalo_data_matrix_unscaled), 
+                                    mean = mean_vals, sd = sd_vals)
+
+# add the id, step_id columns and presence/absence columns to 
+# the scaled data matrix for model fitting
+buffalo_data_scaled_0p <- data.frame(id = buffalo_data$id,  
+                                     step_id = buffalo_data$step_id, 
+                                     y = buffalo_data$y, 
+                                     buffalo_data_matrix_scaled)
+
+```
+
+## 1p
+
+```{r}
+
+buffalo_data_matrix_unscaled <- buffalo_data %>% transmute(
+  
+  # the 'linear' term
+  ndvi = ndvi_temporal,
+  # interact with the harmonic terms
+  ndvi_s1 = ndvi_temporal * hour_s1,
+  ndvi_c1 = ndvi_temporal * hour_c1,
+  
+  ndvi_sq = ndvi_temporal ^ 2,
+  ndvi_sq_s1 = (ndvi_temporal ^ 2) * hour_s1,
+  ndvi_sq_c1 = (ndvi_temporal ^ 2) * hour_c1,
+  
+  canopy = canopy_01,
+  canopy_s1 = canopy_01 * hour_s1,
+  canopy_c1 = canopy_01 * hour_c1,
+  
+  canopy_sq = canopy_01 ^ 2,
+  canopy_sq_s1 = (canopy_01 ^ 2) * hour_s1,
+  canopy_sq_c1 = (canopy_01 ^ 2) * hour_c1,
+  
+  slope = slope,
+  slope_s1 = slope * hour_s1,
+  slope_c1 = slope * hour_c1,
+  
+  herby = veg_herby,
+  herby_s1 = veg_herby * hour_s1,
+  herby_c1 = veg_herby * hour_c1,
+  
+  step_l = sl,
+  step_l_s1 = sl * hour_s1,
+  step_l_c1 = sl * hour_c1,
+
+  log_step_l = log_sl,
+  log_step_l_s1 = log_sl * hour_s1,
+  log_step_l_c1 = log_sl * hour_c1,
+
+  cos_turn_a = cos_ta,
+  cos_turn_a_s1 = cos_ta * hour_s1,
+  cos_turn_a_c1 = cos_ta * hour_c1)
+
+buffalo_data_matrix_scaled <- scale(buffalo_data_matrix_unscaled)
+
+mean_vals <- attr(buffalo_data_matrix_scaled, "scaled:center")
+sd_vals <- attr(buffalo_data_matrix_scaled, "scaled:scale")
+scaling_attributes_1p <- data.frame(variable = names(buffalo_data_matrix_unscaled), 
+                                    mean = mean_vals, sd = sd_vals)
+
+buffalo_data_scaled_1p <- data.frame(id = buffalo_data$id,  
+                                     step_id = buffalo_data$step_id, 
+                                     y = buffalo_data$y, 
+                                     buffalo_data_matrix_scaled)
+
+```
+
+## 2p
+
+```{r}
+
+buffalo_data_matrix_unscaled <- buffalo_data %>% transmute(
+  
+  ndvi = ndvi_temporal,
+  ndvi_s1 = ndvi_temporal * hour_s1,
+  ndvi_s2 = ndvi_temporal * hour_s2,
+  ndvi_c1 = ndvi_temporal * hour_c1,
+  ndvi_c2 = ndvi_temporal * hour_c2,
+  
+  ndvi_sq = ndvi_temporal ^ 2,
+  ndvi_sq_s1 = (ndvi_temporal ^ 2) * hour_s1,
+  ndvi_sq_s2 = (ndvi_temporal ^ 2) * hour_s2,
+  ndvi_sq_c1 = (ndvi_temporal ^ 2) * hour_c1,
+  ndvi_sq_c2 = (ndvi_temporal ^ 2) * hour_c2,
+  
+  canopy = canopy_01,
+  canopy_s1 = canopy_01 * hour_s1,
+  canopy_s2 = canopy_01 * hour_s2,
+  canopy_c1 = canopy_01 * hour_c1,
+  canopy_c2 = canopy_01 * hour_c2,
+  
+  canopy_sq = canopy_01 ^ 2,
+  canopy_sq_s1 = (canopy_01 ^ 2) * hour_s1,
+  canopy_sq_s2 = (canopy_01 ^ 2) * hour_s2,
+  canopy_sq_c1 = (canopy_01 ^ 2) * hour_c1,
+  canopy_sq_c2 = (canopy_01 ^ 2) * hour_c2,
+  
+  slope = slope,
+  slope_s1 = slope * hour_s1,
+  slope_s2 = slope * hour_s2,
+  slope_c1 = slope * hour_c1,
+  slope_c2 = slope * hour_c2,
+  
+  herby = veg_herby,
+  herby_s1 = veg_herby * hour_s1,
+  herby_s2 = veg_herby * hour_s2,
+  herby_c1 = veg_herby * hour_c1,
+  herby_c2 = veg_herby * hour_c2,
+  
+  step_l = sl,
+  step_l_s1 = sl * hour_s1,
+  step_l_s2 = sl * hour_s2,
+  step_l_c1 = sl * hour_c1,
+  step_l_c2 = sl * hour_c2,
+
+  log_step_l = log_sl,
+  log_step_l_s1 = log_sl * hour_s1,
+  log_step_l_s2 = log_sl * hour_s2,
+  log_step_l_c1 = log_sl * hour_c1,
+  log_step_l_c2 = log_sl * hour_c2,
+
+  cos_turn_a = cos_ta,
+  cos_turn_a_s1 = cos_ta * hour_s1,
+  cos_turn_a_s2 = cos_ta * hour_s2,
+  cos_turn_a_c1 = cos_ta * hour_c1,
+  cos_turn_a_c2 = cos_ta * hour_c2)
+
+buffalo_data_matrix_scaled <- scale(buffalo_data_matrix_unscaled)
+
+mean_vals <- attr(buffalo_data_matrix_scaled, "scaled:center")
+sd_vals <- attr(buffalo_data_matrix_scaled, "scaled:scale")
+scaling_attributes_2p <- data.frame(variable = names(buffalo_data_matrix_unscaled), 
+                                    mean = mean_vals, sd = sd_vals)
+
+buffalo_data_scaled_2p <- data.frame(id = buffalo_data$id,  
+                                     step_id = buffalo_data$step_id, 
+                                     y = buffalo_data$y, 
+                                     buffalo_data_matrix_scaled)
+
+```
+
+## 3p
+
+```{r}
+
+buffalo_data_matrix_unscaled <- buffalo_data %>% transmute(
+  
+  ndvi = ndvi_temporal,
+  ndvi_s1 = ndvi_temporal * hour_s1,
+  ndvi_s2 = ndvi_temporal * hour_s2,
+  ndvi_s3 = ndvi_temporal * hour_s3,
+  ndvi_c1 = ndvi_temporal * hour_c1,
+  ndvi_c2 = ndvi_temporal * hour_c2,
+  ndvi_c3 = ndvi_temporal * hour_c3,   
+  
+  ndvi_sq = ndvi_temporal ^ 2,
+  ndvi_sq_s1 = (ndvi_temporal ^ 2) * hour_s1,
+  ndvi_sq_s2 = (ndvi_temporal ^ 2) * hour_s2,
+  ndvi_sq_s3 = (ndvi_temporal ^ 2) * hour_s3,
+  ndvi_sq_c1 = (ndvi_temporal ^ 2) * hour_c1,
+  ndvi_sq_c2 = (ndvi_temporal ^ 2) * hour_c2,
+  ndvi_sq_c3 = (ndvi_temporal ^ 2) * hour_c3,   
+  
+  canopy = canopy_01,
+  canopy_s1 = canopy_01 * hour_s1,
+  canopy_s2 = canopy_01 * hour_s2,
+  canopy_s3 = canopy_01 * hour_s3,
+  canopy_c1 = canopy_01 * hour_c1,
+  canopy_c2 = canopy_01 * hour_c2,
+  canopy_c3 = canopy_01 * hour_c3,   
+  
+  canopy_sq = canopy_01 ^ 2,
+  canopy_sq_s1 = (canopy_01 ^ 2) * hour_s1,
+  canopy_sq_s2 = (canopy_01 ^ 2) * hour_s2,
+  canopy_sq_s3 = (canopy_01 ^ 2) * hour_s3,
+  canopy_sq_c1 = (canopy_01 ^ 2) * hour_c1,
+  canopy_sq_c2 = (canopy_01 ^ 2) * hour_c2,
+  canopy_sq_c3 = (canopy_01 ^ 2) * hour_c3,   
+  
+  slope = slope,
+  slope_s1 = slope * hour_s1,
+  slope_s2 = slope * hour_s2,
+  slope_s3 = slope * hour_s3,
+  slope_c1 = slope * hour_c1,
+  slope_c2 = slope * hour_c2,
+  slope_c3 = slope * hour_c3,   
+  
+  herby = veg_herby,
+  herby_s1 = veg_herby * hour_s1,
+  herby_s2 = veg_herby * hour_s2,
+  herby_s3 = veg_herby * hour_s3,
+  herby_c1 = veg_herby * hour_c1,
+  herby_c2 = veg_herby * hour_c2,
+  herby_c3 = veg_herby * hour_c3,     
+  
+  step_l = sl,
+  step_l_s1 = sl * hour_s1,
+  step_l_s2 = sl * hour_s2,
+  step_l_s3 = sl * hour_s3,
+  step_l_c1 = sl * hour_c1,
+  step_l_c2 = sl * hour_c2,
+  step_l_c3 = sl * hour_c3,
+
+  log_step_l = log_sl,
+  log_step_l_s1 = log_sl * hour_s1,
+  log_step_l_s2 = log_sl * hour_s2,
+  log_step_l_s3 = log_sl * hour_s3,
+  log_step_l_c1 = log_sl * hour_c1,
+  log_step_l_c2 = log_sl * hour_c2,
+  log_step_l_c3 = log_sl * hour_c3,
+
+  cos_turn_a = cos_ta,
+  cos_turn_a_s1 = cos_ta * hour_s1,
+  cos_turn_a_s2 = cos_ta * hour_s2,
+  cos_turn_a_s3 = cos_ta * hour_s3,
+  cos_turn_a_c1 = cos_ta * hour_c1,
+  cos_turn_a_c2 = cos_ta * hour_c2,
+  cos_turn_a_c3 = cos_ta * hour_c3)
+
+buffalo_data_matrix_scaled <- scale(buffalo_data_matrix_unscaled)
+
+mean_vals <- attr(buffalo_data_matrix_scaled, "scaled:center")
+sd_vals <- attr(buffalo_data_matrix_scaled, "scaled:scale")
+scaling_attributes_3p <- data.frame(variable = names(buffalo_data_matrix_unscaled), 
+                                    mean = mean_vals, sd = sd_vals)
+
+buffalo_data_scaled_3p <- data.frame(id = buffalo_data$id,  
+                                     step_id = buffalo_data$step_id, 
+                                     y = buffalo_data$y, 
+                                     buffalo_data_matrix_scaled)
+
+```
+:::
+
+## Model formula
+
+As we have already precomputed and scaled the covariates, quadratic terms and interactions with the harmonics, we just include each parameter as a linear predictor.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_formula
+
+formula_twostep <- y ~ 
+  
+  ndvi +
+  ndvi_sq +
+  canopy +
+  canopy_sq +
+  slope +
+  herby +
+  step_l +
+  log_step_l +
+  cos_turn_a +
+  
+  strata(step_id) +
+  cluster(id)
+
+```
+
+## 1p
+
+```{r}
+
+formula_twostep <- y ~ 
+  
+  ndvi +
+  ndvi_s1 +
+  ndvi_c1 +
+  
+  ndvi_sq +
+  ndvi_sq_s1 +
+  ndvi_sq_c1 +
+  
+  canopy +
+  canopy_s1 +
+  canopy_c1 +
+  
+  canopy_sq +
+  canopy_sq_s1 +
+  canopy_sq_c1 +
+  
+  slope +
+  slope_s1 +
+  slope_c1 +
+  
+  herby +
+  herby_s1 +
+  herby_c1 +
+  
+  step_l +
+  step_l_s1 +
+  step_l_c1 +
+  
+  log_step_l +
+  log_step_l_s1 +
+  log_step_l_c1 +
+
+  cos_turn_a +
+  cos_turn_a_s1 +
+  cos_turn_a_c1 +
+  
+  strata(step_id) +
+  cluster(id)
+
+```
+
+## 2p
+
+```{r}
+
+formula_twostep <- y ~ 
+  
+  ndvi +
+  ndvi_s1 +
+  ndvi_s2 +
+  ndvi_c1 +
+  ndvi_c2 +
+  
+  ndvi_sq +
+  ndvi_sq_s1 +
+  ndvi_sq_s2 +
+  ndvi_sq_c1 +
+  ndvi_sq_c2 +
+  
+  canopy +
+  canopy_s1 +
+  canopy_s2 +
+  canopy_c1 +
+  canopy_c2 +
+  
+  canopy_sq +
+  canopy_sq_s1 +
+  canopy_sq_s2 +
+  canopy_sq_c1 +
+  canopy_sq_c2 +
+  
+  slope +
+  slope_s1 +
+  slope_s2 +
+  slope_c1 +
+  slope_c2 +
+  
+  herby +
+  herby_s1 +
+  herby_s2 +
+  herby_c1 +
+  herby_c2 +
+  
+  step_l +
+  step_l_s1 +
+  step_l_s2 +
+  step_l_c1 +
+  step_l_c2 +
+  
+  log_step_l +
+  log_step_l_s1 +
+  log_step_l_s2 +
+  log_step_l_c1 +
+  log_step_l_c2 +
+
+  cos_turn_a +
+  cos_turn_a_s1 +
+  cos_turn_a_s2 +
+  cos_turn_a_c1 +
+  cos_turn_a_c2 +
+  
+  strata(step_id) +
+  cluster(id)
+
+```
+
+## 3p
+
+```{r}
+
+formula_twostep <- y ~ 
+  
+  ndvi +
+  ndvi_s1 +
+  ndvi_s2 +
+  ndvi_s3 +  
+  ndvi_c1 +
+  ndvi_c2 +
+  ndvi_c3 +  
+  
+  ndvi_sq +
+  ndvi_sq_s1 +
+  ndvi_sq_s2 +
+  ndvi_sq_s3 +  
+  ndvi_sq_c1 +
+  ndvi_sq_c2 +
+  ndvi_sq_c3 +  
+  
+  canopy +
+  canopy_s1 +
+  canopy_s2 +
+  canopy_s3 +  
+  canopy_c1 +
+  canopy_c2 +
+  canopy_c3 +  
+  
+  canopy_sq +
+  canopy_sq_s1 +
+  canopy_sq_s2 +
+  canopy_sq_s3 +  
+  canopy_sq_c1 +
+  canopy_sq_c2 +
+  canopy_sq_c3 +  
+  
+  slope +
+  slope_s1 +
+  slope_s2 +
+  slope_s3 +  
+  slope_c1 +
+  slope_c2 +
+  slope_c3 +  
+  
+  herby +
+  herby_s1 +
+  herby_s2 +
+  herby_s3 +  
+  herby_c1 +
+  herby_c2 +
+  herby_c3 +   
+  
+  step_l +
+  step_l_s1 +
+  step_l_s2 +
+  step_l_s3 +  
+  step_l_c1 +
+  step_l_c2 +
+  step_l_c3 +  
+  
+  log_step_l +
+  log_step_l_s1 +
+  log_step_l_s2 +
+  log_step_l_s3 +  
+  log_step_l_c1 +
+  log_step_l_c2 +
+  log_step_l_c3 +  
+  
+  cos_turn_a +
+  cos_turn_a_s1 +
+  cos_turn_a_s2 +
+  cos_turn_a_s3 +  
+  cos_turn_a_c1 +
+  cos_turn_a_c2 +
+  cos_turn_a_c3 +
+  
+  strata(step_id) +
+  cluster(id)
+
+```
+:::
+
+## Fit the model
+
+As we have already fitted the model, we will load it here, but if the model_fit file doesn't exist, it will run the model fitting code. Be careful here that if you change the model formula, you will need to delete or rename the model_fit file to re-run the model fitting code, otherwise it will just load the previous model.
+
+Due to the large number of covariates when including several pairs of harmonics, particularly when also including quadratic terms, we had difficulty fitting population-level models with the `glmmTMB` [@Brooks2017-eb] and `INLA` [@Rue2009-fn] model fitting approaches [@Muff2020-fu]. We therefore fitted models to all individuals using the 'TwoStep' approach from the `TwoStepCLogit` package [@Craiu2016-bf, @Craiu2011-nn], which can be considered as a computationally efficient alternative to fitting models with individual-level random effects, providing certain conditions are met, namely that all individuals visit every category level when using categorical covariates [@Muff2020-fu]. The first step of the TwoStep approach is to fit individual-level conditional logistic regression models, which are then combined in the second step using the expectation-maximisation (EM) algorithm in conjunction with conditional restricted maximum likelihood to estimate the population-level parameters [@Craiu2011-nn].
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_model_fit
+
+if(file.exists("outputs/model_twostep_0p_harms_wet.rds")) {
+  
+  model_twostep_0p_harms <- readRDS("outputs/model_twostep_0p_harms_wet.rds")
+  
+} else {
+  
+  tic()
+  model_twostep_0p_harms <- Ts.estim(formula = formula_twostep,
+           data = buffalo_data_scaled_0p,
+           all.m.1 = TRUE,
+           D = "UN(1)",
+           itermax = 10000)
+  toc()
+  
+  # save model object
+  saveRDS(model_twostep_0p_harms, file = "outputs/model_twostep_0p_harms_wet.rds")
+  
+  beep(sound = 2)
+
+}
+
+```
+
+## 1p
+
+```{r twostep model fit 1p}
+
+if(file.exists("outputs/model_twostep_1p_harms_wet.rds")) {
+  
+  model_twostep_1p_harms <- readRDS("outputs/model_twostep_1p_harms_wet.rds")
+  
+} else {
+
+  tic()
+  model_twostep_1p_harms <- Ts.estim(formula = formula_twostep,
+           data = buffalo_data_scaled_1p,
+           all.m.1 = TRUE,
+           D = "UN(1)",
+           itermax = 10000)
+  toc()
+  
+  # save model object
+  saveRDS(model_twostep_1p_harms, file = "outputs/model_twostep_1p_harms_wet.rds")
+  
+  beep(sound = 2)
+
+}
+
+```
+
+## 2p
+
+```{r twostep model fit 2p}
+
+if(file.exists("outputs/model_twostep_2p_harms_wet.rds")) {
+  
+  model_twostep_2p_harms <- readRDS("outputs/model_twostep_2p_harms_wet.rds")
+  
+} else {
+
+  tic()
+  model_twostep_2p_harms <- Ts.estim(formula = formula_twostep,
+           data = buffalo_data_scaled_2p,
+           all.m.1 = TRUE,
+           D = "UN(1)",
+           itermax = 10000)
+  toc()
+  
+  # save model object
+  saveRDS(model_twostep_2p_harms, file = "outputs/model_twostep_2p_harms_wet.rds")
+  
+  beep(sound = 2)
+
+}
+
+```
+
+## 3p
+
+```{r twostep model fit 3p}
+
+if(file.exists("outputs/model_twostep_3p_harms_wet.rds")) {
+  
+  model_twostep_3p_harms <- readRDS("outputs/model_twostep_3p_harms_wet.rds")
+  
+} else {
+
+  tic()
+  model_twostep_3p_harms <- Ts.estim(formula = formula_twostep,
+           data = buffalo_data_scaled_3p,
+           all.m.1 = TRUE,
+           D = "UN(1)",
+           itermax = 10000)
+  toc()
+  
+  # save model object
+  saveRDS(model_twostep_3p_harms, file = "outputs/model_twostep_3p_harms_wet.rds")
+  
+  beep(sound = 2)
+
+}
+
+```
+:::
+
+## Check the fitted model outputs
+
+Create a dataframe of the coefficients with the scaling attributes that we saved when creating the data matrix. We can then return the coefficients to their natural scale by dividing by the scaling factor (standard deviation).
+
+As we can see, we have a coefficient for each covariate by itself, and then one for each of the harmonic interactions. These are the 'weights' that we played around with in the `Ecography_DynamicSSF_Walkthrough_Harmonics_and_selection_surfaces` walkthrough script, and we reconstruct them in exactly the same way. We also have the coefficients for the quadratic terms and the interactions with the harmonics, which we have denoted as `ndvi_sq` for instance. We will come back to these when we look at the selection surfaces.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_model_summary
+
+model_twostep_0p_harms
+
+# these create massive outputs for the dynamic models so we've commented them out
+# model_twostep_0p_harms$beta
+# model_twostep_0p_harms$se
+# model_twostep_0p_harms$vcov
+# diag(model_twostep_0p_harms$D) # between cluster variance
+# model_twostep_0p_harms$r.effect # individual estimates
+
+# create a dataframe of the coefficients and their scaling attributes
+coefs_clr_0p <- data.frame(coefs = names(model_twostep_0p_harms$beta), value = model_twostep_0p_harms$beta)
+coefs_clr_0p$scale_sd <- scaling_attributes_0p$sd
+coefs_clr_0p <- coefs_clr_0p %>% mutate(value_nat = value / scale_sd)
+head(coefs_clr_0p)
+
+```
+
+## 1p
+
+```{r}
+
+# creates a huge output due to the correlation matrix
+# model_twostep_1p_harms
+
+# model_twostep_1p_harms
+# model_twostep_1p_harms$beta
+# model_twostep_1p_harms$se
+# model_twostep_1p_harms$vcov
+# diag(model_twostep_1p_harms$D) # between cluster variance
+# model_twostep_1p_harms$r.effect # individual estimates
+
+coefs_clr_1p <- data.frame(coefs = names(model_twostep_1p_harms$beta), 
+                        value = model_twostep_1p_harms$beta)
+coefs_clr_1p$scale_sd <- scaling_attributes_1p$sd
+coefs_clr_1p <- coefs_clr_1p %>% mutate(value_nat = value / scale_sd)
+head(coefs_clr_1p)
+
+```
+
+## 2p
+
+```{r}
+
+# creates a huge output due to the correlation matrix
+# model_twostep_2p_harms
+
+# model_twostep_2p_harms
+# model_twostep_2p_harms$beta
+# model_twostep_2p_harms$se
+# model_twostep_2p_harms$vcov
+# diag(model_twostep_2p_harms$D) # between cluster variance
+# model_twostep_2p_harms$r.effect # individual estimates
+
+# creating data frame of model coefficients
+coefs_clr_2p <- data.frame(coefs = names(model_twostep_2p_harms$beta), 
+                        value = model_twostep_2p_harms$beta)
+coefs_clr_2p$scale_sd <- scaling_attributes_2p$sd
+coefs_clr_2p <- coefs_clr_2p %>% mutate(value_nat = value / scale_sd)
+head(coefs_clr_2p)
+
+```
+
+## 3p
+
+```{r}
+
+# creates a huge output due to the correlation matrix
+# model_twostep_3p_harms
+
+# model_twostep_3p_harms$beta
+# model_twostep_3p_harms$se
+# model_twostep_3p_harms$vcov
+# diag(model_twostep_3p_harms$D) # between cluster variance
+# model_twostep_3p_harms$r.effect # individual estimates
+
+# creating dataframe of coefficients
+coefs_clr_3p <- data.frame(coefs = names(model_twostep_3p_harms$beta), 
+                        value = model_twostep_3p_harms$beta)
+coefs_clr_3p$scale_sd <- scaling_attributes_3p$sd
+coefs_clr_3p <- coefs_clr_3p %>% mutate(value_nat = value / scale_sd)
+head(coefs_clr_3p)
+
+```
+:::
+
+## Reconstruct the temporally dynamic coefficients
+
+First we reconstruct the hourly coefficients for the model with no harmonics. This step isn't necessary as we already have the coefficients, and we have already rescaled them in the dataframe we created above. But as we are also fitting harmonic models and recover their coefficients across time, we have used the same approach here so then we can plot them together and illustrate the static/dynamic outputs of the models. It also means that we can use the same simulation code (which indexes across the hour of the day), and just change the data frame of coefficients (as it will index across the coefficients of the static model but they won't change).
+
+We need a sequence of values that covers a full period (or the period that we want to construct the function over, which can be more or less than 1 period). The sequence can be arbitrarily finely spaced. The smaller the increment the smoother the function will be for plotting. When simulating data from the temporally dynamic coefficients, we will subset to the increment that relates to the data collection and model fitting (i.e. one hour in this case).
+
+Essentially, the coefficients can be considered as weights of the harmonics, which combine into a single function.
+
+Now we can reconstruct the harmonic function using the formula that we put into our model by interacting the harmonic terms with each of the covariates, for two pairs of harmonics (2p) a single covariate, let's say herbaceous vegetation (herby), this would be written down as:
+
+$$
+f = \beta_{herby} + 
+\beta_{herby\_s1} \sin\left(\frac{2\pi t}{24}\right) +
+\beta_{herby\_c1} \cos\left(\frac{2\pi t}{24}\right) +
+\beta_{herby\_s2} \sin\left(\frac{4\pi t}{24}\right) +
+\beta_{herby\_c2} \cos\left(\frac{4\pi t}{24}\right),
+$$
+
+where we have 5 $\beta_{herby}$ coefficients, one for the linear term, and one for each of the harmonic terms.
+
+Here we use matrix multiplication to reconstruct the temporally dynamic coefficients. We provide some background in the `Ecography_DynamicSSF_Walkthrough_Harmonics_and_selection_surfaces` script.
+
+First we create a matrix of the values of the harmonics, which is just the sin and cos terms for each harmonic, and then we can multiply this by the coefficients to get the function. When we use two pairs of harmonics we will have 5 coefficients for each covariate (linear + 2 sine and 2 cosine), so there will be 5 columns in the matrix.
+
+For matrix multiplication, the number of columns in the first matrix must be equal to the number of rows in the second matrix. The result will then have the same number of rows as the first matrix and the same number of columns as the second matrix.
+
+Or in other words, if we have a 24 x 5 matrix of harmonics and a 5 x 1 matrix of coefficients, we will get a 24 x 1 matrix of the function, which corresponds to our 24 hours of the day.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_reconstruct_coefs
+
+# increments are arbitrary - finer results in smoother curves
+# for the simulations we will subset to the step interval
+hour <- seq(0,23.9,0.1) 
+
+# create the dataframe of values of the harmonic terms over the period (here just the linear term)
+hour_harmonics_df_0p <- data.frame("linear_term" = rep(1, length(hour)))
+
+harmonics_scaled_df_0p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "canopy" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "slope" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("slope", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "herby" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "sl" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "log_sl" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))))
+
+harmonics_scaled_long_0p <- pivot_longer(harmonics_scaled_df_0p, 
+                                         cols = !1, 
+                                         names_to = "coef")
+
+```
+
+## 1p
+
+```{r}
+
+# create the dataframe of values of the harmonic terms over the period
+hour_harmonics_df_1p <- data.frame("linear_term" = rep(1, length(hour)),
+                                "hour_s1" = sin(2*pi*hour/24),
+                                "hour_c1" = cos(2*pi*hour/24))
+
+harmonics_scaled_df_1p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "canopy" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "slope" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("slope", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "herby" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "sl" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "log_sl" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))))
+
+harmonics_scaled_long_1p <- pivot_longer(harmonics_scaled_df_1p, 
+                                         cols = !1, 
+                                         names_to = "coef")
+
+```
+
+## 2p
+
+```{r}
+
+# create the dataframe of values of the harmonic terms over the period
+hour_harmonics_df_2p <- data.frame("linear_term" = rep(1, length(hour)),
+                                "hour_s1" = sin(2*pi*hour/24),
+                                "hour_s2" = sin(4*pi*hour/24),
+                                "hour_c1" = cos(2*pi*hour/24),
+                                "hour_c2" = cos(4*pi*hour/24))
+
+harmonics_scaled_df_2p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "canopy" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "slope" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("slope", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "herby" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "sl" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "log_sl" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))))
+
+harmonics_scaled_long_2p <- pivot_longer(harmonics_scaled_df_2p, cols = !1, 
+                                         names_to = "coef")
+
+```
+
+## 3p
+
+```{r}
+
+# create the dataframe of values of the harmonic terms over the period
+hour_harmonics_df_3p <- data.frame("linear_term" = rep(1, length(hour)),
+                                "hour_s1" = sin(2*pi*hour/24),
+                                "hour_s2" = sin(4*pi*hour/24),
+                                "hour_s3" = sin(6*pi*hour/24),
+                                "hour_c1" = cos(2*pi*hour/24),
+                                "hour_c2" = cos(4*pi*hour/24),
+                                "hour_c3" = cos(6*pi*hour/24))
+
+harmonics_scaled_df_3p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "canopy" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "slope" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("slope", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "herby" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "sl" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "log_sl" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))))
+
+harmonics_scaled_long_3p <- pivot_longer(harmonics_scaled_df_3p, cols = !1, 
+                                         names_to = "coef")
+
+```
+:::
+
+## Plot the results - scaled temporally dynamic coefficients
+
+Here we show the temporally-varying coefficients across time (which are currently still scaled).
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_plot_coefs
+
+ggplot() +
+    geom_path(data = harmonics_scaled_long_0p,
+              aes(x = hour, y = value, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+    scale_x_continuous("Hour") +
+    scale_color_discrete("Estimate") +
+    theme_classic() +
+    theme(legend.position = "bottom")
+
+```
+
+## 1p
+
+```{r}
+
+ggplot() +
+    geom_path(data = harmonics_scaled_long_1p,
+              aes(x = hour, y = value, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+    scale_x_continuous("Hour") +
+    scale_color_discrete("Estimate") +
+    theme_classic() +
+    theme(legend.position = "bottom")
+
+```
+
+## 2p
+
+```{r}
+
+ggplot() +
+    geom_path(data = harmonics_scaled_long_2p,
+              aes(x = hour, y = value, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+    scale_x_continuous("Hour") +
+    scale_color_discrete("Estimate") +
+    theme_classic() +
+    theme(legend.position = "bottom")
+
+```
+
+## 3p
+
+```{r}
+
+ggplot() +
+    geom_path(data = harmonics_scaled_long_3p,
+              aes(x = hour, y = value, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+    scale_x_continuous("Hour") +
+    scale_color_discrete("Estimate") +
+    theme_classic() +
+    theme(legend.position = "bottom")
+
+```
+:::
+
+## Reconstructing the natural-scale temporally dynamic coefficients
+
+As we scaled the covariate values prior to fitting the models, we want to rescale the coefficients to their natural scale. This is important for the simulations, as the environmental variables will not be scaled when we simulate steps.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+#| label: 0p_reconstruct_nat_coefs
+
+harmonics_nat_df_0p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "canopy" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "slope" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("slope", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "herby" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "sl" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "log_sl" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_0p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_0p))))
+
+```
+
+## 1p
+
+```{r}
+
+harmonics_nat_df_1p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "canopy" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "slope" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("slope", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "herby" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "sl" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "log_sl" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_1p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_1p))))
+
+```
+
+## 2p
+
+```{r}
+
+harmonics_nat_df_2p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "canopy" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "slope" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("slope", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "herby" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "sl" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "log_sl" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_2p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_2p))))
+
+```
+
+## 3p
+
+```{r}
+
+harmonics_nat_df_3p <- data.frame(
+  "hour" = hour,
+  "ndvi" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("ndvi", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "ndvi_2" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("ndvi_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "canopy" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("canopy", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "canopy_2" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("canopy_sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "slope" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("slope", coefs) & !grepl("sq", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "herby" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("herby", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "sl" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("step_l", coefs) & !grepl("log", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "log_sl" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("log_step_l", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))),
+  "cos_ta" = as.numeric(
+    coefs_clr_3p %>% dplyr::filter(grepl("cos", coefs)) %>% 
+      pull(value_nat) %>% t() %*% t(as.matrix(hour_harmonics_df_3p))))
+
+```
+:::
+
+## Update the Gamma and von Mises distributions
+
+To update the Gamma and von Mises distribution from the tentative distributions [e.g. @Fieberg2021-wx, Appendix C], we just do the calculation at each time point (for the natural-scale coefficients).
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+# from the step generation script
+tentative_shape <- 0.438167
+tentative_scale <- 534.3507
+tentative_kappa <- 0.1848126
+
+hour_coefs_nat_df_0p <- harmonics_nat_df_0p %>% 
+  mutate(shape = tentative_shape + log_sl,
+         scale = 1/((1/tentative_scale) - sl),
+         kappa = tentative_kappa + cos_ta)
+
+# save the coefficients to use in the simulations
+write_csv(hour_coefs_nat_df_0p,
+          paste0("outputs/TwoStep_0pDaily_coefs_wet_", Sys.Date(), ".csv"))
+
+# turning into a long data frame
+hour_coefs_nat_long_0p <- pivot_longer(hour_coefs_nat_df_0p, 
+                                       cols = !1, 
+                                       names_to = "coef")
+
+```
+
+## 1p
+
+```{r}
+
+hour_coefs_nat_df_1p <- harmonics_nat_df_1p %>% 
+  mutate(shape = tentative_shape + log_sl,
+         scale = 1/((1/tentative_scale) - sl),
+         kappa = tentative_kappa + cos_ta)
+
+# save the coefficients to use in the simulations
+write_csv(hour_coefs_nat_df_1p,
+          paste0("outputs/TwoStep_1pDaily_coefs_wet_",Sys.Date(), ".csv"))
+
+# turning into a long data frame
+hour_coefs_nat_long_1p <- pivot_longer(hour_coefs_nat_df_1p, 
+                                       cols = !1, names_to = "coef")
+
+```
+
+## 2p
+
+```{r}
+
+hour_coefs_nat_df_2p <- harmonics_nat_df_2p %>% 
+  mutate(shape = tentative_shape + log_sl,
+         scale = 1/((1/tentative_scale) - sl),
+         kappa = tentative_kappa + cos_ta)
+
+# save the coefficients to use in the simulations
+write_csv(hour_coefs_nat_df_2p,
+          paste0("outputs/TwoStep_2pDaily_coefs_wet_",Sys.Date(), ".csv"))
+
+# turning into a long data frame
+hour_coefs_nat_long_2p <- pivot_longer(hour_coefs_nat_df_2p, cols = !1, 
+                                       names_to = "coef")
+
+```
+
+## 3p
+
+```{r}
+
+hour_coefs_nat_df_3p <- harmonics_nat_df_3p %>% 
+  mutate(shape = tentative_shape + log_sl,
+         scale = 1/((1/tentative_scale) - sl),
+         kappa = tentative_kappa + cos_ta)
+
+# save the coefficients to use in the simulations
+write_csv(hour_coefs_nat_df_3p,
+          paste0("outputs/TwoStep_3pDaily_coefs_wet_", Sys.Date(), ".csv"))
+
+# turning into a long data frame
+hour_coefs_nat_long_3p <- pivot_longer(hour_coefs_nat_df_3p, cols = !1, 
+                                       names_to = "coef")
+
+```
+:::
+
+## Plot the natural-scale temporally dynamic coefficients
+
+Now that the coefficients are in their natural scales, they will be larger or smaller depending on the scale of the covariate.
+
+Plot just the habitat selection coefficients.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+ggplot() +
+  geom_path(data = hour_coefs_nat_long_0p %>%
+              filter(!coef %in% c("shape", "scale", "kappa")),
+            aes(x = hour, y = value, colour = coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_color_discrete("Estimate") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+```
+
+## 1p
+
+```{r}
+
+ggplot() +
+  geom_path(data = hour_coefs_nat_long_1p %>%
+              filter(!coef %in% c("shape", "scale", "kappa")),
+            aes(x = hour, y = value, colour = coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_color_discrete("Estimate") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+```
+
+## 2p
+
+```{r}
+
+ggplot() +
+  geom_path(data = hour_coefs_nat_long_2p %>%
+              filter(!coef %in% c("shape", "scale", "kappa")),
+            aes(x = hour, y = value, colour = coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_color_discrete("Estimate") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+```
+
+## 3p
+
+```{r}
+
+ggplot() +
+  geom_path(data = hour_coefs_nat_long_3p %>%
+              filter(!coef %in% c("shape", "scale", "kappa")),
+            aes(x = hour, y = value, colour = coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(expression(Time-varying~parameter~values~beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_color_discrete("Estimate") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+```
+:::
+
+## Plot only the temporally dynamic movement parameters
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+ggplot() +
+    geom_path(data = hour_coefs_nat_long_0p %>% 
+              filter(coef %in% c("shape", "kappa")),
+              aes(x = hour, y = value, colour = coef)) +
+  geom_path(data = hour_coefs_nat_long_0p %>%
+              filter(coef == "scale"),
+              aes(x = hour, y = value/1000, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  ggtitle("Note that the scale parameter is divided by 1000 for plotting") +
+  scale_color_discrete("Estimate",
+      labels = c("kappa" = "von Mises kappa",
+                 "scale" = "Gamma scale / 1000",
+                 "shape" = "Gamma shape")) +
+    theme_classic() +
+    theme(legend.position = "right")
+
+```
+
+## 1p
+
+```{r}
+
+ggplot() +
+    geom_path(data = hour_coefs_nat_long_1p %>% 
+              filter(coef %in% c("shape", "kappa")),
+              aes(x = hour, y = value, colour = coef)) +
+  geom_path(data = hour_coefs_nat_long_1p %>%
+              filter(coef == "scale"),
+              aes(x = hour, y = value/1000, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  ggtitle("Note that the scale parameter is divided by 1000 for plotting") +
+  scale_color_discrete("Estimate",
+      labels = c("kappa" = "von Mises kappa",
+                 "scale" = "Gamma scale / 1000",
+                 "shape" = "Gamma shape")) +
+    theme_classic() +
+    theme(legend.position = "right")
+
+```
+
+## 2p
+
+```{r}
+
+ggplot() +
+    geom_path(data = hour_coefs_nat_long_2p %>% 
+              filter(coef %in% c("shape", "kappa")),
+              aes(x = hour, y = value, colour = coef)) +
+  geom_path(data = hour_coefs_nat_long_2p %>%
+              filter(coef == "scale"),
+              aes(x = hour, y = value/1000, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous("Value of parameter") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  ggtitle("*Note that the scale parameter is divided by 1000 for plotting") +
+  scale_color_discrete("Estimate",
+      labels = c("kappa" = "von Mises kappa",
+                 "scale" = "Gamma scale / 1000",
+                 "shape" = "Gamma shape")) +
+    theme_classic() +
+    theme(legend.position = "right")
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R2/temporal_mvmt_params_",
+#          Sys.Date(), ".png"),
+#   width=150, height=90, units="mm", dpi = 1000)
+
+```
+
+## 3p
+
+```{r}
+
+ggplot() +
+    geom_path(data = hour_coefs_nat_long_3p %>% 
+              filter(coef %in% c("shape", "kappa")),
+              aes(x = hour, y = value, colour = coef)) +
+  geom_path(data = hour_coefs_nat_long_3p %>%
+              filter(coef == "scale"),
+              aes(x = hour, y = value/1000, colour = coef)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_y_continuous(expression(beta)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  ggtitle("Note that the scale parameter is divided by 1000 for plotting") +
+  scale_color_discrete("Estimate",
+      labels = c("kappa" = "von Mises kappa",
+                 "scale" = "Gamma scale / 1000",
+                 "shape" = "Gamma shape")) +
+    theme_classic() +
+    theme(legend.position = "right")
+
+```
+:::
+
+## Sample from temporally dynamic movement parameters
+
+Here we sample from the movement kernel to generate a distribution of step lengths for each hour of the day, to assess how well it matches the observed step lengths. This is the 'selection-free' movement kernel, so the step lengths and turning angles from the simulations will be different, as the steps will be conditioned on the habitat, but this is a useful diagnostic to assess whether the harmonics are capturing the observed movement dynamics.
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+# summarise the observed step lengths by hour
+movement_summary_buffalo <- buffalo_data %>% 
+  filter(y == 1) %>% 
+  group_by(id, hour) %>% 
+  summarise(mean_sl = mean(sl), median_sl = median(sl))
+
+# number of samples at each hour (more = smoother plotting, but slower)
+n <- 1e5
+
+gamma_dist_list <- vector(mode = "list", length = nrow(hour_coefs_nat_df_0p))
+gamma_mean <- c()
+gamma_median <- c()
+gamma_ratio <- c()
+
+for(hour_no in 1:nrow(hour_coefs_nat_df_0p)) {
+  
+  gamma_dist_list[[hour_no]] <- rgamma(n, shape = hour_coefs_nat_df_0p$shape[hour_no], 
+                                       scale = hour_coefs_nat_df_0p$scale[hour_no])
+  
+  gamma_mean[hour_no] <- mean(gamma_dist_list[[hour_no]])
+  gamma_median[hour_no] <- median(gamma_dist_list[[hour_no]])
+  gamma_ratio[hour_no] <- gamma_mean[hour_no] / gamma_median[hour_no]
+
+}
+
+gamma_df_0p <- data.frame(model = "0p", 
+                          hour = hour_coefs_nat_df_0p$hour, 
+                          mean = gamma_mean, 
+                          median = gamma_median, 
+                          ratio = gamma_ratio) 
+
+mean_sl_0p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = mean_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_0p, 
+            aes(x = hour, y = mean), colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Mean step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled mean step length",
+          subtitle = "No harmonics") +
+  theme_classic() +
+  theme(legend.position = "right")
+
+mean_sl_0p
+
+
+median_sl_0p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = median_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_0p, aes(x = hour, y = median), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Median step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled median step length",
+          subtitle = "No harmonics") +
+  theme_classic() +
+  theme(legend.position = "right")
+
+median_sl_0p
+
+
+# comparing the mean and median step lengths across all hours
+# across the hours by individual buffalo
+buffalo_data_all %>% filter(y == 1) %>%  group_by(id) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+# all buffalo
+buffalo_data_all %>% filter(y == 1) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+# fitted model
+gamma_df_0p %>% summarise(mean_mean = mean(mean),
+                         median_mean = mean(median), 
+                         ratio_mean = mean_mean/median_mean)
+
+```
+
+## 1p
+
+```{r}
+
+gamma_dist_list <- vector(mode = "list", length = nrow(hour_coefs_nat_df_1p))
+gamma_mean <- c()
+gamma_median <- c()
+gamma_ratio <- c()
+
+for(hour_no in 1:nrow(hour_coefs_nat_df_1p)) {
+  
+  gamma_dist_list[[hour_no]] <- rgamma(n, 
+                                       shape = hour_coefs_nat_df_1p$shape[hour_no], 
+                                       scale = hour_coefs_nat_df_1p$scale[hour_no])
+  
+  gamma_mean[hour_no] <- mean(gamma_dist_list[[hour_no]])
+  gamma_median[hour_no] <- median(gamma_dist_list[[hour_no]])
+  gamma_ratio[hour_no] <- gamma_mean[hour_no] / gamma_median[hour_no]
+
+}
+
+gamma_df_1p <- data.frame(model = "1p", 
+                          hour = hour_coefs_nat_df_1p$hour, 
+                          mean = gamma_mean, 
+                          median = gamma_median, 
+                          ratio = gamma_ratio) 
+
+mean_sl_1p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = mean_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_1p, 
+            aes(x = hour, y = mean), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Mean step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled mean step length",
+          subtitle = "One pair of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+mean_sl_1p
+
+median_sl_1p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = median_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_1p, 
+            aes(x = hour, y = median), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Median step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled median step length",
+          subtitle = "One pair of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+median_sl_1p
+
+# across the hours
+buffalo_data_all %>% filter(y == 1) %>%  group_by(id) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+buffalo_data_all %>% filter(y == 1) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+gamma_df_1p %>% summarise(mean_mean = mean(mean),
+                      median_mean = mean(median), 
+                      ratio_mean = mean_mean/median_mean)
+
+```
+
+## 2p
+
+```{r}
+
+gamma_dist_list <- vector(mode = "list", length = nrow(hour_coefs_nat_df_2p))
+gamma_mean <- c()
+gamma_median <- c()
+gamma_ratio <- c()
+
+for(hour_no in 1:nrow(hour_coefs_nat_df_2p)) {
+  
+gamma_dist_list[[hour_no]] <- rgamma(n, 
+                                     shape = hour_coefs_nat_df_2p$shape[hour_no], 
+                                     scale = hour_coefs_nat_df_2p$scale[hour_no])
+
+gamma_mean[hour_no] <- mean(gamma_dist_list[[hour_no]])
+gamma_median[hour_no] <- median(gamma_dist_list[[hour_no]])
+gamma_ratio[hour_no] <- gamma_mean[hour_no] / gamma_median[hour_no]
+
+}
+
+gamma_df_2p <- data.frame(model = "2p", 
+                          hour = hour_coefs_nat_df_2p$hour, 
+                          mean = gamma_mean, 
+                          median = gamma_median, 
+                          ratio = gamma_ratio) 
+
+mean_sl_2p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = mean_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_2p, 
+            aes(x = hour, y = mean), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Mean step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled mean step length",
+          subtitle = "Two pairs of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+mean_sl_2p
+
+median_sl_2p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = median_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_2p, 
+            aes(x = hour, y = median), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Median step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled median step length",
+          subtitle = "Two pairs of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+median_sl_2p
+
+# across the hours
+buffalo_data_all %>% filter(y == 1) %>%  group_by(id) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+buffalo_data_all %>% filter(y == 1) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+gamma_df_2p %>% summarise(mean_mean = mean(mean),
+                         median_mean = mean(median), 
+                         ratio_mean = mean_mean/median_mean)
+
+```
+
+## 3p
+
+```{r}
+
+gamma_dist_list <- vector(mode = "list", length = nrow(hour_coefs_nat_df_3p))
+gamma_mean <- c()
+gamma_median <- c()
+gamma_ratio <- c()
+
+for(hour_no in 1:nrow(hour_coefs_nat_df_3p)) {
+  
+gamma_dist_list[[hour_no]] <- rgamma(n, 
+                                     shape = hour_coefs_nat_df_3p$shape[hour_no], 
+                                     scale = hour_coefs_nat_df_3p$scale[hour_no])
+
+gamma_mean[hour_no] <- mean(gamma_dist_list[[hour_no]])
+gamma_median[hour_no] <- median(gamma_dist_list[[hour_no]])
+gamma_ratio[hour_no] <- gamma_mean[hour_no] / gamma_median[hour_no]
+
+}
+
+gamma_df_3p <- data.frame(model = "3p", 
+                          hour = hour_coefs_nat_df_3p$hour, 
+                          mean = gamma_mean, 
+                          median = gamma_median, 
+                          ratio = gamma_ratio)
+
+mean_sl_3p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = mean_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_3p, 
+            aes(x = hour, y = mean), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Mean step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled mean step length",
+          subtitle = "Three pairs of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+mean_sl_3p
+
+median_sl_3p <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = median_sl, colour = factor(id))) +
+  geom_path(data = gamma_df_3p, 
+            aes(x = hour, y = median), 
+            colour = "red", linetype = "dashed") +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Median step length") +
+  scale_colour_viridis_d("Buffalo") +
+  ggtitle("Observed and modelled median step length",
+          subtitle = "Three pairs of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+median_sl_3p
+
+# across the hours
+buffalo_data_all %>% filter(y == 1) %>%  group_by(id) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+buffalo_data_all %>% filter(y == 1) %>% 
+  summarise(mean_sl = mean(sl), 
+            median_sl = median(sl), 
+            ratio = mean_sl/median_sl)
+
+gamma_df_3p %>% summarise(mean_mean = mean(mean),
+                      median_mean = mean(median), 
+                      ratio_mean = mean_mean/median_mean)
+
+```
+:::
+
+## Creating selection surfaces
+
+As we have both quadratic and harmonic terms in the model, we can reconstruct a 'selection surface' to visualise how the animal's respond to environmental features changes through time.
+
+To illustrate, if we don't have temporal dynamics (as is the case for this model), then we have a coefficient for the linear term and a coefficient for the quadratic term. Using these, we can plot the selection curve at the scale of the environmental variable (in this case NDVI).
+
+Using the natural scale coefficients from the model:
+
+```{r}
+
+# first get a sequence of NDVI values, 
+# starting from the minimum observed in the data to the maximum
+ndvi_min <- min(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_max <- max(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_seq <- seq(ndvi_min, ndvi_max, by = 0.01)
+
+# take the coefficients from the model and calculation the selection value 
+# for every NDVI value in this sequence
+
+# we can separate to the linear term
+ndvi_linear_selection <- hour_coefs_nat_df_0p$ndvi[1] * ndvi_seq 
+plot(x = ndvi_seq, y = ndvi_linear_selection,
+     main = "Selection for NDVI - linear term",
+     xlab = "NDVI", ylab = "Estimated selection")
+lines(ndvi_seq, rep(0,length(ndvi_seq)), lty = "dashed")
+
+# and the quadratic term
+ndvi_quadratic_selection <- (hour_coefs_nat_df_0p$ndvi_2[1] * (ndvi_seq ^ 2))
+plot(x = ndvi_seq, y = ndvi_quadratic_selection,
+     main = "Selection for NDVI - quadratic term",
+     xlab = "NDVI", ylab = "Estimated selection")
+lines(ndvi_seq, rep(0,length(ndvi_seq)), lty = "dashed")
+
+# and the sum of both
+ndvi_sum_selection <- ndvi_linear_selection + ndvi_quadratic_selection
+plot(x = ndvi_seq, y = ndvi_sum_selection,
+     main = "Selection for NDVI - sum of linear and quadratic terms",
+     xlab = "NDVI", ylab = "Estimated selection")
+lines(ndvi_seq, rep(0,length(ndvi_seq)), lty = "dashed")
+
+```
+
+When there are no temporal dynamics, then this quadratic curve will be the same throughout the day, but when we have temporally dynamic coefficients for both the linear term and the quadratic term, then we will have a curves that vary continuously throughout the day, which we can visualise as a selection surface.
+
+Here we illustrate for the model with 2 pairs of harmonic terms.
+
+For brevity we won't plot the linear and quadratic terms separately, but we can do so if needed.
+
+First for **Hour 3**
+
+```{r}
+
+hour_no <- 3
+
+# we can separate to the linear term
+ndvi_linear_selection <- 
+  hour_coefs_nat_df_1p$ndvi[which(hour_coefs_nat_df_1p$hour == hour_no)] * ndvi_seq
+# plot(x = ndvi_seq, y = ndvi_linear_selection,
+#      main = "Selection for NDVI - linear term",
+#      xlab = "NDVI", ylab = "Estimated selection")
+
+# and the quadratic term
+ndvi_quadratic_selection <- 
+  (hour_coefs_nat_df_1p$ndvi_2[which(hour_coefs_nat_df_1p$hour == hour_no)] * (ndvi_seq ^ 2))
+# plot(x = ndvi_seq, y = ndvi_quadratic_selection,
+#      main = "Selection for NDVI - quadratic term",
+#      xlab = "NDVI", ylab = "Estimated selection")
+
+# and the sum of both
+ndvi_sum_selection <- ndvi_linear_selection + ndvi_quadratic_selection
+plot(x = ndvi_seq, y = ndvi_sum_selection,
+     main = "Selection for NDVI - sum of linear and quadratic terms",
+     xlab = "NDVI", ylab = "Estimated selection")
+lines(ndvi_seq, rep(0,length(ndvi_seq)), lty = "dashed")
+
+```
+
+We can see that the coefficient at hour 3 shows highest selection for NDVI values slightly above 0.2, and the coefficient is mostly negative.
+
+Secondly for **Hour 12**
+
+```{r}
+
+hour_no <- 12
+
+# we can separate to the linear term
+ndvi_linear_selection <- 
+  hour_coefs_nat_df_1p$ndvi[which(hour_coefs_nat_df_1p$hour == hour_no)] * ndvi_seq
+# plot(x = ndvi_seq, y = ndvi_linear_selection,
+#      main = "Selection for NDVI - linear term",
+#      xlab = "NDVI", ylab = "Estimated selection")
+
+# and the quadratic term
+ndvi_quadratic_selection <- 
+  (hour_coefs_nat_df_1p$ndvi_2[which(hour_coefs_nat_df_1p$hour == hour_no)] * (ndvi_seq ^ 2))
+# plot(x = ndvi_seq, y = ndvi_quadratic_selection,
+#      main = "Selection for NDVI - quadratic term",
+#      xlab = "NDVI", ylab = "Estimated selection")
+
+# and the sum of both
+ndvi_sum_selection <- ndvi_linear_selection + ndvi_quadratic_selection
+plot(x = ndvi_seq, y = ndvi_sum_selection,
+     main = "Selection for NDVI - sum of linear and quadratic terms",
+     xlab = "NDVI", ylab = "Estimated selection")
+lines(ndvi_seq, rep(0,length(ndvi_seq)), lty = "dashed")
+
+```
+
+Whereas for hour 12, the coefficient shows highest selection for NDVI values slightly above 0.4, and the coefficient is positive for NDVI values above 0.
+
+We can imagine viewing these plots for every hour of the day, where each hour has a different quadratic curve, but this would be a lot of plots. We can also see it as a 3D surface, where the x-axis is the hour of the day, the y-axis is the NDVI value, and the z-axis (colour) is the coefficient value.
+
+We simply index over the linear and quadratic terms and calculate the coefficient values at every time point.
+
+## NDVI selection surface
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+ndvi_min <- min(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_max <- max(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_seq <- seq(ndvi_min, ndvi_max, by = 0.01)
+
+# Create empty data frame
+ndvi_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_0p), 
+                                       nrow = length(ndvi_seq)))
+
+# loop over each time increment, calculating the selection values for each NDVI value
+# and storing each time increment as a column in a dataframe that we can use for plotting
+for(i in 1:nrow(hour_coefs_nat_df_0p)) {
+  # Assign the vector as a column to the dataframe
+  ndvi_fresponse_df[,i] <- (hour_coefs_nat_df_0p$ndvi[i] * ndvi_seq) + 
+    (hour_coefs_nat_df_0p$ndvi_2[i] * (ndvi_seq ^ 2))
+}
+
+ndvi_fresponse_df <- data.frame(ndvi_seq, ndvi_fresponse_df)
+colnames(ndvi_fresponse_df) <- c("ndvi", hour)
+ndvi_fresponse_long <- pivot_longer(ndvi_fresponse_df, 
+                                    cols = !1, names_to = "hour")
+
+ndvi_contour_max <- max(ndvi_fresponse_long$value) # 0.7890195
+ndvi_contour_min <- min(ndvi_fresponse_long$value) # -0.7945691
+ndvi_contour_increment <- (ndvi_contour_max-ndvi_contour_min)/10
+
+ndvi_quad_0p <- ggplot(data = ndvi_fresponse_long, 
+                       aes(x = as.numeric(hour), y = ndvi)) +
+  geom_point(aes(colour = value)) + 
+  geom_contour(aes(z = value), 
+               breaks = seq(ndvi_contour_increment, 
+                            ndvi_contour_max, 
+                            ndvi_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), 
+               breaks = seq(-ndvi_contour_increment, 
+                            ndvi_contour_min, 
+                            -ndvi_contour_increment), 
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("NDVI value", breaks = seq(-1, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  ggtitle("Normalised Difference Vegetation Index (NDVI)") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+ndvi_quad_0p
+
+```
+
+## 1p
+
+```{r}
+
+ndvi_min <- min(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_max <- max(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_seq <- seq(ndvi_min, ndvi_max, by = 0.01)
+
+# Create empty data frame
+ndvi_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_1p), 
+                                       nrow = length(ndvi_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_1p)) {
+  # Assign the vector as a column to the dataframe
+  ndvi_fresponse_df[,i] <- (hour_coefs_nat_df_1p$ndvi[i] * ndvi_seq) + 
+    (hour_coefs_nat_df_1p$ndvi_2[i] * (ndvi_seq ^ 2))
+}
+
+ndvi_fresponse_df <- data.frame(ndvi_seq, ndvi_fresponse_df)
+colnames(ndvi_fresponse_df) <- c("ndvi", hour)
+ndvi_fresponse_long <- pivot_longer(ndvi_fresponse_df, cols = !1, names_to = "hour")
+
+ndvi_contour_max <- max(ndvi_fresponse_long$value) # 0.7890195
+ndvi_contour_min <- min(ndvi_fresponse_long$value) # -0.7945691
+ndvi_contour_increment <- (ndvi_contour_max-ndvi_contour_min)/10
+
+ndvi_quad_1p <- ggplot(data = ndvi_fresponse_long, 
+                       aes(x = as.numeric(hour), y = ndvi)) +
+  geom_point(aes(colour = value)) + # colour = "white"
+  geom_contour(aes(z = value), 
+               breaks = seq(ndvi_contour_increment, 
+                            ndvi_contour_max, 
+                            ndvi_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), 
+               breaks = seq(-ndvi_contour_increment, 
+                            ndvi_contour_min, 
+                            -ndvi_contour_increment), 
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("NDVI value", breaks = seq(-1, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Normalised Difference Vegetation Index (NDVI)") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+ndvi_quad_1p
+
+```
+
+## 2p
+
+```{r}
+
+ndvi_min <- min(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_max <- max(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_seq <- seq(ndvi_min, ndvi_max, by = 0.01)
+
+# Create empty data frame
+ndvi_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_2p), 
+                                       nrow = length(ndvi_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_2p)) {
+  # Assign the vector as a column to the dataframe
+  ndvi_fresponse_df[,i] <- (hour_coefs_nat_df_2p$ndvi[i] * ndvi_seq) + 
+    (hour_coefs_nat_df_2p$ndvi_2[i] * (ndvi_seq ^ 2))
+}
+
+ndvi_fresponse_df <- data.frame(ndvi_seq, ndvi_fresponse_df)
+colnames(ndvi_fresponse_df) <- c("ndvi", hour)
+ndvi_fresponse_long <- pivot_longer(ndvi_fresponse_df, cols = !1, 
+                                    names_to = "hour")
+
+ndvi_contour_max <- max(ndvi_fresponse_long$value) # 0.7890195
+ndvi_contour_min <- min(ndvi_fresponse_long$value) # -0.7945691
+ndvi_contour_increment <- (ndvi_contour_max-ndvi_contour_min)/10
+
+ndvi_quad_2p <- ggplot(data = ndvi_fresponse_long, 
+                       aes(x = as.numeric(hour), y = ndvi)) +
+  geom_point(aes(colour = value)) + # colour = "white"
+  geom_contour(aes(z = value), 
+               breaks = seq(ndvi_contour_increment, 
+                            ndvi_contour_max, 
+                            ndvi_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), 
+               breaks = seq(-ndvi_contour_increment, 
+                            ndvi_contour_min, 
+                            -ndvi_contour_increment), 
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("NDVI value", breaks = seq(-1, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Normalised Difference Vegetation Index (NDVI)") +
+  theme_classic() +
+  theme(legend.position = "right")
+
+ndvi_quad_2p
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R2/ndvi_selection_surface_legend_",
+#          Sys.Date(), ".png"),
+#   width=170, height=90, units="mm", dpi = 1000)
+
+```
+
+## 3p
+
+```{r}
+
+ndvi_min <- min(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_max <- max(buffalo_data$ndvi_temporal, na.rm = TRUE)
+ndvi_seq <- seq(ndvi_min, ndvi_max, by = 0.01)
+
+# Create empty data frame
+ndvi_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_3p), 
+                                       nrow = length(ndvi_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_3p)) {
+  # Assign the vector as a column to the dataframe
+  ndvi_fresponse_df[,i] <- (hour_coefs_nat_df_3p$ndvi[i] * ndvi_seq) + 
+    (hour_coefs_nat_df_3p$ndvi_2[i] * (ndvi_seq ^ 2))
+}
+
+ndvi_fresponse_df <- data.frame(ndvi_seq, ndvi_fresponse_df)
+colnames(ndvi_fresponse_df) <- c("ndvi", hour)
+ndvi_fresponse_long <- pivot_longer(ndvi_fresponse_df, cols = !1, 
+                                    names_to = "hour")
+
+ndvi_contour_max <- max(ndvi_fresponse_long$value) # 0.7890195
+ndvi_contour_min <- min(ndvi_fresponse_long$value) # -0.7945691
+ndvi_contour_increment <- (ndvi_contour_max-ndvi_contour_min)/10
+
+ndvi_quad_3p <- ggplot(data = ndvi_fresponse_long, 
+                       aes(x = as.numeric(hour), y = ndvi)) +
+  geom_point(aes(colour = value)) + # colour = "white"
+  geom_contour(aes(z = value), 
+               breaks = seq(ndvi_contour_increment, 
+                            ndvi_contour_max, 
+                            ndvi_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), 
+               breaks = seq(-ndvi_contour_increment, 
+                            ndvi_contour_min, 
+                            -ndvi_contour_increment), 
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("NDVI value", breaks = seq(-1, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Normalised Difference Vegetation Index (NDVI)") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+ndvi_quad_3p
+
+```
+:::
+
+## Canopy cover selection surface
+
+::: {.panel-tabset group="model"}
+## 0p
+
+```{r}
+
+canopy_min <- min(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_max <- max(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_seq <- seq(canopy_min, canopy_max, by = 0.01)
+
+# Create empty data frame
+canopy_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_0p), 
+                                         nrow = length(canopy_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_0p)) {
+  # Assign the vector as a column to the dataframe
+  canopy_fresponse_df[,i] <- (hour_coefs_nat_df_0p$canopy[i] * canopy_seq) + 
+    (hour_coefs_nat_df_0p$canopy_2[i] * (canopy_seq ^ 2))
+}
+
+canopy_fresponse_df <- data.frame(canopy_seq, canopy_fresponse_df)
+colnames(canopy_fresponse_df) <- c("canopy", hour)
+canopy_fresponse_long <- pivot_longer(canopy_fresponse_df, 
+                                      cols = !1, 
+                                      names_to = "hour")
+
+canopy_contour_min <- min(canopy_fresponse_long$value) # 0
+canopy_contour_max <- max(canopy_fresponse_long$value) # 2.181749
+canopy_contour_increment <- (canopy_contour_max-canopy_contour_min)/10
+
+canopy_quad_0p <- ggplot(data = canopy_fresponse_long, aes(x = as.numeric(hour), 
+                                                           y = canopy)) +
+  geom_point(aes(colour = value)) +
+  geom_contour(aes(z = value), 
+               breaks = seq(canopy_contour_increment, canopy_contour_max, 
+                            canopy_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value),
+  breaks = seq(-canopy_contour_increment, canopy_contour_min,
+               -canopy_contour_increment),
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("Canopy cover", breaks = seq(0, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  ggtitle("Canopy Cover") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+canopy_quad_0p
+
+```
+
+## 1p
+
+```{r}
+
+canopy_min <- min(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_max <- max(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_seq <- seq(canopy_min, canopy_max, by = 0.01)
+
+# Create empty data frame
+canopy_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_1p), 
+                                         nrow = length(canopy_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_1p)) {
+  # Assign the vector as a column to the dataframe
+  canopy_fresponse_df[,i] <- (hour_coefs_nat_df_1p$canopy[i] * canopy_seq) + 
+    (hour_coefs_nat_df_1p$canopy_2[i] * (canopy_seq ^ 2))
+}
+
+canopy_fresponse_df <- data.frame(canopy_seq, canopy_fresponse_df)
+colnames(canopy_fresponse_df) <- c("canopy", hour)
+canopy_fresponse_long <- pivot_longer(canopy_fresponse_df, cols = !1, 
+                                      names_to = "hour")
+
+canopy_contour_min <- min(canopy_fresponse_long$value) # 0
+canopy_contour_max <- max(canopy_fresponse_long$value) # 2.181749
+canopy_contour_increment <- (canopy_contour_max-canopy_contour_min)/10
+
+canopy_quad_1p <- ggplot(data = canopy_fresponse_long, 
+                         aes(x = as.numeric(hour), y = canopy)) +
+  geom_point(aes(colour = value)) +
+  geom_contour(aes(z = value), 
+               breaks = seq(canopy_contour_increment, 
+                            canopy_contour_max, 
+                            canopy_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value),
+               breaks = seq(-canopy_contour_increment, 
+                            canopy_contour_min, 
+                            -canopy_contour_increment),
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("Canopy cover", breaks = seq(0, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Canopy Cover") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+canopy_quad_1p
+
+```
+
+## 2p
+
+```{r}
+
+canopy_min <- min(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_max <- max(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_seq <- seq(canopy_min, canopy_max, by = 0.01)
+
+# Create empty data frame
+canopy_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_2p), 
+                                         nrow = length(canopy_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_2p)) {
+  # Assign the vector as a column to the dataframe
+  canopy_fresponse_df[,i] <- (hour_coefs_nat_df_2p$canopy[i] * canopy_seq) + 
+    (hour_coefs_nat_df_2p$canopy_2[i] * (canopy_seq ^ 2))
+}
+
+canopy_fresponse_df <- data.frame(canopy_seq, canopy_fresponse_df)
+colnames(canopy_fresponse_df) <- c("canopy", hour)
+canopy_fresponse_long <- pivot_longer(canopy_fresponse_df, cols = !1, 
+                                      names_to = "hour")
+
+canopy_contour_min <- min(canopy_fresponse_long$value) # 0
+canopy_contour_max <- max(canopy_fresponse_long$value) # 2.181749
+canopy_contour_increment <- (canopy_contour_max-canopy_contour_min)/10
+
+canopy_quad_2p <- ggplot(data = canopy_fresponse_long, 
+                         aes(x = as.numeric(hour), y = canopy)) +
+  geom_point(aes(colour = value)) +
+  geom_contour(aes(z = value), 
+               breaks = seq(canopy_contour_increment, 
+                            canopy_contour_max, 
+                            canopy_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value),
+               breaks = seq(-canopy_contour_increment, 
+                            canopy_contour_min, 
+                            -canopy_contour_increment),
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("Canopy cover", breaks = seq(0, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Canopy Cover") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+canopy_quad_2p
+
+```
+
+## 3p
+
+```{r}
+
+canopy_min <- min(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_max <- max(buffalo_data$canopy_01, na.rm = TRUE)
+canopy_seq <- seq(canopy_min, canopy_max, by = 0.01)
+
+# Create empty data frame
+canopy_fresponse_df <- data.frame(matrix(ncol = nrow(hour_coefs_nat_df_3p), 
+                                         nrow = length(canopy_seq)))
+
+for(i in 1:nrow(hour_coefs_nat_df_3p)) {
+  # Assign the vector as a column to the dataframe
+  canopy_fresponse_df[,i] <- (hour_coefs_nat_df_3p$canopy[i] * canopy_seq) + 
+    (hour_coefs_nat_df_3p$canopy_2[i] * (canopy_seq ^ 2))
+}
+
+canopy_fresponse_df <- data.frame(canopy_seq, canopy_fresponse_df)
+colnames(canopy_fresponse_df) <- c("canopy", hour)
+canopy_fresponse_long <- pivot_longer(canopy_fresponse_df, cols = !1, 
+                                      names_to = "hour")
+
+canopy_contour_min <- min(canopy_fresponse_long$value) # 0
+canopy_contour_max <- max(canopy_fresponse_long$value) # 2.181749
+canopy_contour_increment <- (canopy_contour_max-canopy_contour_min)/10
+
+canopy_quad_3p <- ggplot(data = canopy_fresponse_long, 
+                         aes(x = as.numeric(hour), y = canopy)) +
+  geom_point(aes(colour = value)) +
+  geom_contour(aes(z = value), 
+               breaks = seq(canopy_contour_increment, 
+                            canopy_contour_max, 
+                            canopy_contour_increment), 
+               colour = "black", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value),
+               breaks = seq(-canopy_contour_increment, 
+                            canopy_contour_min, 
+                            -canopy_contour_increment),
+               colour = "red", linewidth = 0.25, linetype = "dashed") +
+  geom_contour(aes(z = value), breaks = 0, colour = "black", linewidth = 0.5) +
+  scale_x_continuous("Hour", breaks = seq(0,24,6)) +
+  scale_y_continuous("Canopy cover", breaks = seq(0, 1, 0.25)) +
+  scale_colour_viridis_c("Selection") +
+  # ggtitle("Canopy Cover", 
+  #         subtitle = "Three pairs of harmonics") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+canopy_quad_3p
+
+```
+:::
+
+# Combining the plots
+
+## Movement parameters
+
+```{r}
+
+gamma_df <- rbind(gamma_df_0p, gamma_df_1p, gamma_df_2p, gamma_df_3p)
+gamma_df <- gamma_df %>% mutate(model_f = as.numeric(factor(model)))
+
+mean_sl <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = mean_sl, group = factor(id)), 
+            alpha = 0.25) +
+  geom_path(data = gamma_df, aes(x = hour, y = mean, linetype = model)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Mean step length") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+  ggtitle("Observed and modelled mean step length") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+mean_sl
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/mean_sl_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=90, units="mm", dpi = 1000)
+
+median_sl <- ggplot() +
+  geom_path(data = movement_summary_buffalo, 
+            aes(x = hour, y = median_sl, group = factor(id)), 
+            alpha = 0.25) +
+  geom_path(data = gamma_df, aes(x = hour, y = median, linetype = model)) +
+  scale_x_continuous("Hour", breaks = seq(0,24,2)) +
+  scale_y_continuous("Median step length") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+  ggtitle("Observed and modelled median step length") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+median_sl
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/median_sl_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=90, units="mm", dpi = 1000)
+
+```
+
+## Habitat selection
+
+```{r}
+
+harmonics_scaled_long_0p <- harmonics_scaled_long_0p %>% mutate(model = "0p")
+harmonics_scaled_long_1p <- harmonics_scaled_long_1p %>% mutate(model = "1p")
+harmonics_scaled_long_2p <- harmonics_scaled_long_2p %>% mutate(model = "2p")
+harmonics_scaled_long_3p <- harmonics_scaled_long_3p %>% mutate(model = "3p")
+
+harmonics_scaled_long_Mp <- rbind(harmonics_scaled_long_0p, 
+                                  harmonics_scaled_long_1p, 
+                                  harmonics_scaled_long_2p, 
+                                  harmonics_scaled_long_3p)
+
+coef_titles <- unique(harmonics_scaled_long_Mp$coef)
+
+
+ndvi_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "ndvi"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+      ggtitle("NDVI") +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+ndvi_harms
+
+
+
+ndvi_2_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "ndvi_2"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+      ggtitle(expression(NDVI^2)) +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+ndvi_2_harms
+
+
+
+canopy_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "canopy"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+      ggtitle("Canopy cover") +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+canopy_harms
+
+
+
+canopy_2_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "canopy_2"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+      ggtitle(expression(Canopy~cover^2)) +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+canopy_2_harms
+
+
+
+herby_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "herby"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta), limits = c(-0.4,0.15)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"), 
+                        values=c(4,3,2,1)) +
+      ggtitle("Herbaceous vegetation") +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+herby_harms
+
+
+
+slope_harms <- ggplot() +
+      geom_path(data = harmonics_scaled_long_Mp %>%
+                filter(coef == "slope"), 
+                aes(x = hour, y = value, linetype = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+      scale_y_continuous(expression(beta), limits = c(-0.4,0.15)) +
+      scale_x_continuous("Hour") +
+  scale_linetype_manual("Model", breaks=c("0p","1p", "2p", "3p"),
+                        values=c(4,3,2,1)) +
+      ggtitle("Slope") +
+      theme_classic() +
+      theme(legend.position = "bottom")
+
+slope_harms
+
+ggarrange(herby_harms, 
+          slope_harms, 
+          labels = c("A", "B"), 
+          ncol = 2, nrow = 1,
+          align = "hv",
+          legend = "bottom", 
+          common.legend = TRUE)
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/herby_slope_harmonic_functions_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=90, units="mm", dpi = 1000)
+
+```
+
+# Combining selection surfaces
+
+## NDVI
+
+-   A = 0p model
+-   B = 1p model
+-   C = 2p model
+-   D = 3p model
+
+```{r}
+
+ggarrange(ndvi_quad_0p + theme(plot.title = element_blank(),
+                               axis.title.x = element_blank(),
+                               axis.text.x = element_blank()), 
+          
+          ndvi_quad_1p + theme(plot.title = element_blank(), 
+                               axis.title.x = element_blank(),
+                               axis.text.x = element_blank(),
+                               axis.title.y = element_blank(),
+                               ), 
+          
+          ndvi_quad_2p, 
+          
+          ndvi_quad_3p + theme(plot.title = element_blank(), 
+                               axis.title.y = element_blank(),
+                               ),
+          
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow = 2,
+          legend = "bottom",
+          common.legend = TRUE)
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/",
+#               "NDVI_2x2_CLR_TS_daily_GvM_10rs_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=120, units="mm", dpi = 1000)
+
+```
+
+## Canopy cover
+
+-   A = 0p model
+-   B = 1p model
+-   C = 2p model
+-   D = 3p model
+
+```{r}
+
+ggarrange(canopy_quad_0p + theme(plot.title = element_blank(),
+                               axis.title.x = element_blank(),
+                               axis.text.x = element_blank()), 
+          
+          canopy_quad_1p + theme(plot.title = element_blank(), 
+                               axis.title.x = element_blank(),
+                               axis.text.x = element_blank(),
+                               axis.title.y = element_blank(),
+                               ), 
+          
+          canopy_quad_2p, 
+          
+          canopy_quad_3p + theme(plot.title = element_blank(), 
+                               axis.title.y = element_blank(),
+                               ),
+          
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow = 2,
+          legend = "bottom",
+          common.legend = TRUE)
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/",
+#               "canopy_2x2_CLR_TS_daily_GvM_10rs_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=120, units="mm", dpi = 1000)
+
+```
+
+# Adding all selection surfaces to the same plot
+
+We combine these plots into the plot that is in the paper. On the top is the **NDVI** selection surface, and on the bottom is the **canopy cover** selection surface.
+
+::: {.panel-tabset group="model"}
+
+## 0p
+
+```{r}
+
+surface_plots_0p <- ggarrange(ndvi_quad_0p + 
+            ggtitle("0p") +
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank()), 
+          
+          canopy_quad_0p +  
+            scale_x_continuous("Hour", breaks = c(0,12,24)) +
+            theme(plot.title = element_blank()), 
+         
+          ncol = 1, nrow = 2,
+          align = "v",
+          legend = "none",
+          common.legend = TRUE)
+
+surface_plots_0p
+
+```
+
+## 1p
+
+```{r}
+
+surface_plots_1p <- ggarrange(ndvi_quad_1p + 
+            ggtitle("1p") +
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank(),
+                  axis.title.y = element_blank(),
+                  axis.text.y = element_blank()), 
+          
+          canopy_quad_1p + 
+            theme(plot.title = element_blank(), 
+                  axis.title.y = element_blank(),
+                  axis.text.y = element_blank()),
+          
+          ncol = 1, nrow = 2,
+          align = "v",
+          legend = "none",
+          common.legend = TRUE)
+
+surface_plots_1p
+
+```
+
+## 2p
+
+```{r}
+
+surface_plots_2p <- ggarrange(ndvi_quad_2p + 
+            ggtitle("2p") +
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank(),
+                  axis.title.y = element_blank(),
+                  axis.text.y = element_blank()),
+          
+          canopy_quad_2p + 
+            theme(plot.title = element_blank(), 
+                  axis.title.y = element_blank(),
+                  axis.text.y = element_blank()),
+          
+          ncol = 1, nrow = 2,
+          align = "v",
+          legend = "none",
+          common.legend = TRUE) 
+
+surface_plots_2p
+
+```
+
+## 3p
+
+```{r}
+
+surface_plots_3p <- ggarrange(ndvi_quad_3p + 
+            ggtitle("3p") +
+              theme(axis.title.x = element_blank(),
+                    axis.text.x = element_blank(),
+                    axis.title.y = element_blank(),
+                    axis.text.y = element_blank()),
+           
+           canopy_quad_3p + 
+            theme(plot.title = element_blank(), 
+                  axis.title.y = element_blank(),
+                  axis.text.y = element_blank()),
+          
+          ncol = 1, nrow = 2,
+          align = "v",
+          legend = "none",
+          common.legend = TRUE)
+
+surface_plots_3p
+
+```
+
+:::
+
+## All selection surfaces
+
+```{r}
+
+all_selection_surfaces <- ggarrange(surface_plots_0p, surface_plots_1p, surface_plots_2p, surface_plots_3p,
+          ncol = 4, nrow = 1,
+          legend = "none",
+          legend.grob = get_legend(ndvi_quad_2p)
+          )
+
+all_selection_surfaces
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/",
+#               "all_quad_4x1_CLR_TS_daily_GvM_10rs_", 
+#          Sys.Date(), ".png"),
+#   width=150, height=110, units="mm", dpi = 1000)
+
+```
+
+## References
+
+::: {#refs}
+:::
+
+## Session info
+
+```{r}
+
+sessionInfo()
+
+```

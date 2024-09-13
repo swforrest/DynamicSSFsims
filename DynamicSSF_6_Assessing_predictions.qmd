@@ -1,0 +1,1215 @@
+---
+title: "Assessing landscape scale predictions from simulations"
+subtitle: "Reading in the outputs of the 'Aggregating_simulations' script, which was run on the QUT HPC"
+author: "Scott Forrest"
+date: "`r Sys.Date()`"
+execute: 
+  cache: false
+bibliography: references.bib
+toc: true
+number-sections: false
+format: 
+  html:
+    self-contained: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    code-line-numbers: true
+    code-overflow: scroll
+    fig-format: png
+    fig-dpi: 300
+  pdf:
+    geometry: 
+      - top=30mm
+      - left=30mm
+editor:
+  source
+---
+
+```{r setup}
+#| label: img_params
+#| code-summary: "Setting image parameters"
+#| include: false
+
+```
+
+## Load packages
+
+```{r}
+#| label: packages
+#| code-summary: "Load packages"
+#| message: false
+#| warning: false
+
+# install.packages("magick")
+
+library(tidyverse)
+packages <- c("amt", "lubridate", "terra", "tictoc", "beepr", 
+              "ecospat", "ggpattern", "magick")
+walk(packages, require, character.only = T)
+
+```
+
+# Load observed buffalo data for validation
+
+```{r}
+
+# importing data, mostly for plotting
+buffalo_data_all <- read_csv("outputs/buffalo_parametric_popn_covs_GvM_10rs_2024-09-04.csv")
+
+buffalo_data_all <- buffalo_data_all %>% 
+  mutate(t1_ = lubridate::with_tz(buffalo_data_all$t1_, tzone = "Australia/Darwin"),
+         t2_ = lubridate::with_tz(buffalo_data_all$t2_, tzone = "Australia/Darwin"))
+
+buffalo_data_all <- buffalo_data_all %>%
+  mutate(t1_rounded = round_date(t1_, "hour"), 
+         hour_t1 = hour(t1_rounded),
+         t2 = t2_, 
+         t2_rounded = round_date(t2_, "hour"), 
+         hour_t2 = hour(t2_rounded),
+         hour = ifelse(hour_t2 == 0, 24, hour_t2),
+         yday = yday(t2),
+         year = year(t2), 
+         month = month(t2))
+
+# ensure that we have just the individuals that were used for model fitting
+buffalo_year_ids <- c(2005, 2014, 2018, 2021, 2022, 2024, 2039, 
+                      2154, 2158, 2223, 2327, 2387, 2393) 
+buffalo_data_all <- buffalo_data_all %>% filter(id %in% buffalo_year_ids)
+buffalo_data_all <- buffalo_data_all %>% filter(t1_ < "2019-07-25 09:32:42 ACST")
+buffalo_ids <- unique(buffalo_data_all$id)
+
+# make a dataframe of only the presence locations
+buffalo_data_all_pres <- buffalo_data_all %>% filter(y == 1)
+
+# convert to track object for step lengths and turning angles etc
+buffalo_data_all_pres <- buffalo_data_all_pres %>% 
+  mk_track(id = id, x1_, y1_, t1_, order_by_ts = T, all_cols = T, crs = 3112) %>% 
+  arrange(id)
+
+```
+
+## Subset the buffalo data to the late dry season 2018 for validation
+
+```{r}
+
+months_wet <- c(1:4, 11:12)
+
+buffalo_data_all_dry2018 <- buffalo_data_all %>% 
+  filter(!month %in% months_wet & year == 2018) # dry season 2018
+
+# subset by spatial extent
+buffalo_data_subset_dry2018 <- buffalo_data_all_dry2018 %>% filter(
+  x2_ > 20000 & x2_ < 40000 & y2_ > -1445000 & y2_ < -1425000) 
+
+# total number of observed locations for that period
+buffalo_data_subset_dry2018 %>% filter(y == 1) %>% summarise(n = n())
+# number of observed locations per hour for that period
+buffalo_data_subset_dry2018 %>% filter(y == 1) %>% group_by(hour) %>% summarise(n = n())
+# standard deviation of the number of observed locations across the hours
+buffalo_data_subset_dry2018 %>% filter(y == 1) %>% group_by(hour) %>% summarise(n = n()) %>% pull(n) %>% sd()
+
+```
+
+# Long-term predictions 
+
+Using all simulated locations from each model, which cover a ~4-month period, and not splitting up by the hour of the day.
+
+## Load prediction maps
+
+List all the .tif files in the HPC directory, which are the outputs of the `DynamicSSF_4a_Aggregating_simulations.R` script.
+
+```{r}
+
+setwd("Z:/ssa_simulations/prediction_maps")
+
+sim_data_list <- list.files(pattern = "*.tif", full.names = F)
+sim_data_list
+
+# create a list of the prediction maps from the 'Aggregating simulations' script
+# here only pull out the results from the subsetted landscape with 25m resolution
+list_all_points_subset <- lapply(sim_data_list[grepl("freq_points_res_25", sim_data_list) & 
+                                     grepl("subset", sim_data_list)], rast)
+
+# stack into a raster stack
+raster_all_points_25x25_subset <- rast(list_all_points_subset)
+
+# check that they have the expected total number of simulated locations 
+# should be around 300,000
+terra::global(raster_all_points_25x25_subset, fun = "sum", na.rm = TRUE)
+
+```
+
+For the predictions, we aggregate the 25m cells into 50m cells. Predictions on a 50m scale are fine enough for our purposes, and require fewer simulations than predictions at 25m scales (i.e. on average 1/4).
+
+```{r}
+
+raster_all_points_subset <- aggregate(raster_all_points_25x25_subset, fact = 2, fun = sum)
+
+# total number of simulated locations should be the same
+terra::global(raster_all_points_25x25_subset, fun = "sum", na.rm = TRUE)
+
+```
+
+### Create dataframes of raster values to plot with ggplot
+
+```{r}
+
+# unnormalised
+df_all_points_subset <- lapply(raster_all_points_subset, function(x) {
+  return(as.data.frame(x, xy = TRUE))
+})
+
+```
+
+## KDE of buffalo locations for plotting
+
+We try several different options to estimate the KDE bandwidth, although as this is for plotting, we find that manually setting the bandwidth gave the best results. The reference bandwidth was too broad and the plug-in bandwidth was too narrow leading to many clusters of space use, which made it difficult to assess general space use by each individual buffalo.
+
+```{r}
+
+min_x <- min(df_all_points_subset[[1]]$x)
+min_y <- min(df_all_points_subset[[1]]$y)
+
+# set the origin of x and y at 0,0
+buffalo_data_subset_dry2018 <- buffalo_data_subset_dry2018 %>% mutate(x00 = x1_ - min_x, y00 = y1_ - min_y)
+# set origin of template raster to 0,0
+template_raster <- raster_all_points_subset[[1]]
+ext(template_raster) <- c(0, 2e4, 0, 2e4)
+
+# convert to track object to use HR analyses
+buffalo_data_subset_dry2018_pres_track <- buffalo_data_subset_dry2018 %>% filter(y == 1) %>%
+  mk_track(id = id, x00, y00, t1_, order_by_ts = T, all_cols = T, crs = 3112) %>% 
+  arrange(id)
+
+buffalo_data_subset_nested <- buffalo_data_subset_dry2018_pres_track %>%
+  nest(data = !id)
+
+buffalo_hr <- buffalo_data_subset_nested %>%
+  mutate(
+    
+    hr_mcp = map(data, hr_mcp), 
+    
+    hr_kde_ref = map(data, ~ hr_kde(.,
+                                    trast = template_raster,
+                                    h = hr_kde_ref(.),
+                                    levels = c(0.5, 0.95))),
+    
+    hr_kde_pi = map(data, ~ hr_kde(.,
+                                   trast = template_raster,
+                                   h = hr_kde_pi(.),
+                                   levels = c(0.5, 0.95))),
+    
+    hr_kde_manual = map(data, ~ hr_kde(.,
+                                       trast = template_raster,
+                                       h = c(150,150),
+                                       levels = c(0.5, 0.95))),
+    
+    hr_kde_ref_iso = map(hr_kde_ref, hr_isopleths),
+    hr_kde_pi_iso = map(hr_kde_pi, hr_isopleths),
+    hr_kde_manual_iso = map(hr_kde_manual, hr_isopleths)
+    
+  )
+
+# to plot the KDEs - we decided that the manual approach was the best for plotting
+# the reference was too diffuse and the plug-in was too narrow
+# walk(buffalo_hr$hr_kde_ref, ~ plot(.x$ud, main = "Reference bandwidth"))
+# walk(buffalo_hr$hr_kde_pi, ~ plot(.x$ud, main = "Plug-in bandwidth"))
+# walk(buffalo_hr$hr_kde_manual, ~ plot(.x$ud, main = "Manual bandwidth"))
+# walk(buffalo_hr$hr_kde_ref_iso, ~ plot(.x$geometry))
+# walk(buffalo_hr$hr_kde_pi_iso, ~ plot(.x$geometry))
+# walk(buffalo_hr$hr_kde_manual_iso, ~ plot(.x$geometry))
+
+buffalo_isopleths <- buffalo_hr %>% dplyr::select(id, hr_kde_ref_iso, hr_kde_pi_iso, hr_kde_manual_iso) %>% 
+  pivot_longer(!id, names_to = "estimator", values_to = "hr") %>% 
+  unnest(cols = hr)
+
+```
+
+## Plot using ggplot, with buffalo KDE density overlaid
+
+```{r}
+
+models <- c("0p", "1p", "2p", "3p")
+min_x <- min(df_all_points_subset[[1]]$x)
+min_y <- min(df_all_points_subset[[1]]$y)
+
+# for equal colour scaling, find min and max number of simulated locations in any cell
+# min_prob <- min(df_all_points_subset[[1]]$sum)
+# the min number of simulated locations is close to 0
+min_prob <- 0
+# max number of simulated locations in any one cell is in the 1p predictions, 
+# we scale the colours to that
+max_prob <- max(df_all_points_subset[[2]]$sum)
+
+for(i in 1:length(df_all_points_subset)) {
+
+  print(ggplot() +
+          geom_raster(data = df_all_points_subset[[i]], aes(x = x - min_x, y = y - min_y, fill = sum)) +
+          scale_fill_viridis_c("Simulated locations", limits = c(min_prob, max_prob)) +
+          
+          geom_sf_pattern(data = buffalo_isopleths %>% filter(estimator == "hr_kde_manual_iso" & level == 0.95),
+                  aes(geometry = geometry), 
+                  pattern = "none", 
+                  pattern_angle = 45,
+                  pattern_size = 0.025,
+                  pattern_spacing = 0.005,
+                  pattern_density = 0.01,
+                  pattern_colour = "white",
+                  pattern_fill = "white",
+                  colour = "white", 
+                  linewidth = 0.2, 
+                  linetype = "twodash", 
+                  alpha = 0) + #
+          
+          geom_sf_pattern(data = buffalo_isopleths %>% filter(estimator == "hr_kde_manual_iso" & level == 0.5),
+                  aes(geometry = geometry), 
+                  pattern = "none", 
+                  pattern_angle = 135,
+                  pattern_size = 0.025,
+                  pattern_spacing = 0.005,
+                  pattern_density = 0.01,
+                  pattern_colour = "white",
+                  pattern_fill = "white",
+                  colour = "white", 
+                  linewidth = 0.25, 
+                  alpha = 0) + 
+          
+          scale_x_continuous("Easting") +
+          scale_y_continuous("Northing") +
+          ggtitle(paste0("Model ", models[i])) +
+          theme_bw() +
+          theme(legend.position = "right",
+                axis.title.x = element_text(size = 8),  # reduce x-axis title text size
+                axis.title.y = element_text(size = 8),  # reduce y-axis title text size
+                axis.text.x = element_text(size = 5),   # reduce x-axis text size
+                axis.text.y = element_text(size = 5),   # reduce y-axis text size
+                plot.title = element_text(size = 10),
+                legend.text = element_text(size = 6),
+                legend.title = element_text(size = 7))
+  )
+  
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/sim_predictions_subset_KDE_", models[i], ".png"), #_legend
+  #        width=80, height=75, units="mm", dpi = 1000)
+  
+}
+
+```
+
+## Plot a subset to show detail of an area of high observed use (KDE density)
+
+```{r}
+
+for(i in 1:length(df_all_points_subset)) {
+
+  print(ggplot() +
+          
+          geom_raster(data = df_all_points_subset[[i]], aes(x = x - min_x, y = y - min_y, fill = sum)) +
+          scale_fill_viridis_c("Simulated locations", limits = c(min_prob, max_prob)) +
+          
+          geom_sf_pattern(data = buffalo_isopleths %>% filter(estimator == "hr_kde_manual_iso" & level == 0.95),
+                  aes(geometry = geometry), 
+                  pattern = "none", 
+                  pattern_angle = 45,
+                  pattern_size = 0.05,
+                  pattern_spacing = 0.015,
+                  pattern_density = 0.01,
+                  pattern_colour = "white",
+                  pattern_fill = "white",
+                  colour = "white", 
+                  linewidth = 0.25, 
+                  alpha = 0) + 
+          
+          geom_sf_pattern(data = buffalo_isopleths %>% filter(estimator == "hr_kde_manual_iso" & level == 0.5),
+                  aes(geometry = geometry), 
+                  pattern = "none", 
+                  pattern_angle = 135,
+                  pattern_size = 0.05,
+                  pattern_spacing = 0.015,
+                  pattern_density = 0.01,
+                  pattern_colour = "white",
+                  pattern_fill = "white",
+                  colour = "white", 
+                  linewidth = 0.5, 
+                  alpha = 0) + 
+          
+          scale_x_continuous("Easting", limits = c(5000, 10000)) +
+          scale_y_continuous("Northing", limits = c(10000, 15000)) +
+          ggtitle(paste0("Model ", models[i])) +
+          theme_bw() +
+          theme(legend.position = "right",
+                axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+                axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+                axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+                axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+                plot.title = element_text(size = 10),
+                legend.text = element_text(size = 6),
+                legend.title = element_text(size = 7))
+  )
+  
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/sim_predictions_subset_subset_KDE_", models[i], ".png"), #_legend
+  #        width=80, height=75, units="mm", dpi = 1000)
+  
+}
+
+```
+
+## Histograms of cells and observed locations
+
+The Boyce index assesses the number of observed locations and where the model predicts there to be locations. A histogram is a useful way to determine where a model may be over- or under-predicting.
+
+```{r}
+
+# relevant presence locations
+obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1) %>% transmute(x = x2_, y = y2_)
+
+for(i in 1:length(df_all_points_subset)) {
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_all_points_subset[[i]], obs_data, ID = FALSE)[,1]
+  
+  print(ggplot() +
+          geom_histogram(data = df_all_points_subset[[i]], 
+                       aes(x = sum, fill = ..x..), 
+                       bins = 100) +
+          scale_fill_viridis_c("Simulated locations", limits = c(min_prob, max_prob)) +
+          geom_histogram(data = data.frame(sum = obs),
+                       aes(x = sum), 
+                       colour = "black", linewidth = 0.1, fill = "white", alpha = 0.9,
+                       bins = 100) +
+          scale_x_continuous("Simulated locations per cell", breaks = seq(0,4500,500)) +
+          scale_y_log10("No. of cells") +
+          ggtitle(paste0("Model ", models[i])) +
+          theme_classic() +
+          theme(legend.position = "none",
+      axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+      axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+      axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+      axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+      plot.title = element_text(size = 10)))
+    
+      # ggsave(paste0("outputs/plots/manuscript_figs_R1/sim_predictions_histogram_", models[i], ".png"),
+      # width=75, height=30, units="mm", dpi = 1000)
+}
+
+```
+
+# Validation
+
+Calculating the Boyce index for each model's long-term predictions. We checked both the Spearman rank correlation coefficient (which assesses monotnicity, that the values increase or decrease), and the Pearson correlation coefficient (which assesses linearity). For the manuscript we used the Spearman rank correlation coeffiicent, as it indicates which areas are likely to be used more often, relative to other areas. The Pearson correlation coefficient also shows the same relative trend of performance between models.
+
+## Long-term predictions
+
+```{r}
+
+# the defaults are 10 and 100
+bi_window_width <- 10
+bi_res <- 100
+
+models <- c("0p", "1p", "2p", "3p")
+
+F_ratio_list <- vector(mode = "list", length = nlyr(raster_all_points_subset))
+
+spearman_corr_subset <- vector(mode = "numeric", length = nlyr(raster_all_points_subset))
+pearson_corr_subset <- vector(mode = "numeric", length = nlyr(raster_all_points_subset))
+
+obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1) %>% transmute(x = x2_, y = y2_)
+
+for(i in 1:nlyr(raster_all_points_subset)) {
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_all_points_subset[[i]], obs_data, ID = FALSE)[,1]
+  obs <- obs[!is.na(obs)]
+  # all values of the raster layer
+  abs <- terra::values(raster_all_points_subset[[i]], na.rm = T)[,1]
+  abs <- abs[!is.na(abs)]
+  
+  window.w <- (max(abs) - min(abs))/bi_window_width
+  
+  boyce_index_spearman <- ecospat.boyce(abs, obs, 
+                                        window.w = window.w,
+                                        res = bi_res,
+                                        method = "spearman", 
+                                        PEplot = F)
+  
+  spearman_corr_subset[i] <- boyce_index_spearman$cor
+  
+  boyce_index_pearson <- ecospat.boyce(abs, obs, 
+                                       method = "pearson", 
+                                       PEplot = F)
+  pearson_corr_subset[i] <- boyce_index_pearson$cor
+  
+  F_ratio_list[[i]] <- data.frame(model = models[i],
+                           F.ratio = boyce_index_pearson$F.ratio,
+                           HS = boyce_index_pearson$HS,
+                           HS_scaled = (boyce_index_pearson$HS - min(boyce_index_pearson$HS)) /
+                             (max(boyce_index_pearson$HS) - min(boyce_index_pearson$HS)))
+  
+}
+
+sp_PB_all_subset <- data.frame(hour = 1:nlyr(raster_all_points_subset),
+                               corr = "Spearman",
+                               BI = "PB",
+                               model = c("0p", "1p", "2p", "3p"),
+                               value = spearman_corr_subset)
+
+sp_PB_all_subset
+
+pe_PB_all_subset <- data.frame(hour = 1:nlyr(raster_all_points_subset),
+                               corr = "Pearson",
+                               BI = "PB",
+                               model = c("0p", "1p", "2p", "3p"),
+                               value = pearson_corr_subset)
+
+pe_PB_all_subset
+
+```
+
+## Plotting the F ratio values for each model
+
+We can see from this plot that the predictions from the 0p model don't predict the areas of high use well, which is likely due an averaging over the habitat selection coefficients. The dynamic models perform mostly similarly, although the 1p model predicts very high buffalo use in areas that weren't used at all, such as the road in the upper right of the prediction map.
+
+```{r}
+
+F_ratio_df <- bind_rows(F_ratio_list)
+
+ggplot(F_ratio_df, aes(x = HS, y = F.ratio, colour = model)) +
+  geom_line(alpha = 0.75, linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_colour_viridis_d("Model") +
+  scale_x_continuous("Simulated locations per cell") +
+  scale_y_log10("F-ratio") +
+  theme_bw() +
+          theme(legend.position = "right",
+      axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+      axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+      axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+      axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+      plot.title = element_text(size = 10),
+      legend.text = element_text(size = 5),
+      legend.title = element_text(size = 8))
+
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/sim_predictions_subset_validation_all_",
+  #        Sys.Date(), ".png"),
+  #   width=145, height=40, units="mm", dpi = 1000)
+  
+```
+
+## Plotting the Spearman and Pearson correlation values for each model
+
+```{r}
+
+subset_BI_results <- bind_rows(sp_PB_all_subset, 
+                               pe_PB_all_subset)
+
+ggplot(subset_BI_results %>% filter(BI == "PB"),
+       aes(x = model, y = value, color = corr)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  # geom_line() +
+  scale_y_continuous(limits = c(0, 1)) +
+  ggtitle("Continuous Boyce Index") +
+  # facet_wrap(~BI + corr) +
+  theme_classic()
+
+```
+
+# Subsetting by hour
+
+Here we have split the simulated locations up into each hour of the day, and we validate against the observed buffalo locations for those hours.
+
+As there is a prediction map for each hour, which creates a very large html file, we will just plot a couple example prediction maps.
+
+::: {.panel-tabset}
+
+## 0p
+
+```{r}
+
+setwd("Z:/ssa_simulations/hourly_prediction_maps/0p")
+
+# list files in the folder
+filenames_0p_hourly <- list.files(pattern = "*.tif", full.names = F)
+
+# read in as rasters
+predictions_0p_hourly <- lapply(filenames_0p_hourly, rast)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", filenames_0p_hourly)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+
+# order the layers by hour
+list_0p_hour_points_subset <- predictions_0p_hourly[order]
+
+# stack into a raster stack
+raster_0p_hourly_points_subset <- rast(list_0p_hour_points_subset)
+
+# aggregate to 50m resolution
+raster_all_points_subset <- aggregate(raster_0p_hourly_points_subset, fact = 2, fun = sum)
+
+```
+
+### Create dataframes of raster values to plot with ggplot
+
+```{r}
+
+sum(is.na(values(raster_0p_hourly_points_subset[[1]])))
+
+# raster_0p_hourly_points_subset_norm <- rast(lapply(raster_0p_hourly_points_subset, normalise_raster))
+
+# change NA values to 0
+raster_0p_hourly_points_subset <- terra::classify(raster_0p_hourly_points_subset, cbind(NA, 0))
+
+df_0p_hourly_points_subset <- lapply(raster_0p_hourly_points_subset, function(x) {
+  return(as.data.frame(x, xy = TRUE, na.rm = FALSE))
+})
+
+```
+
+### Plot using ggplot, with buffalo locations overlaid
+
+```{r}
+##| layout-ncol: 3
+
+which_plots <- c(3,7,12)
+
+max_locs <- max(sapply(1:length(df_0p_hourly_points_subset), function(x) {
+  max(df_0p_hourly_points_subset[[x]]$sum)
+}))
+
+for(i in 1:length(which_plots)) {
+  print(ggplot() +
+          geom_raster(data = df_0p_hourly_points_subset[[which_plots[i]]], aes(x = x, y = y, fill = sum)) +
+          geom_point(data = buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i), 
+                     aes(x = x2_, y = y2_), size = 0.1, col = "white", alpha = 0.5) +
+          coord_equal() +
+        scale_x_continuous("Easting") +
+          
+        scale_y_continuous("Northing") +
+          ggtitle(paste("Model 0p - Hour ", which_plots[i])) +
+          scale_fill_viridis_c(limits = c(0, max_locs)) +
+          theme_bw() +
+        theme(legend.position = "none",
+    axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+    axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+    axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+    axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+    plot.title = element_text(size = 10)))
+  
+  # loop over all hours to save the plots for the gif
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/hourly/sim_predictions_subset_0p_hour_", i, ".png"),
+  # width=80, height=75, units="mm", dpi = 600)
+  
+}
+
+```
+
+### Create a gif of the hourly predictions
+
+Uncomment the last few lines to have the gif created. We show the gif in the readme of the GitHub repo: <https://github.com/swforrest/dynamic_SSF_sims>.
+
+```{r}
+
+sim_preds_0p_img_unordered <- list.files(path = "outputs/plots/manuscript_figs_R1/hourly/",
+                                 pattern = "0p",
+                                 full.names = F)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", sim_preds_0p_img_unordered)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+sim_preds_0p_img_files <- sim_preds_0p_img_unordered[order]
+
+# read in the ordered image files into a list to convert to gif
+# sim_preds_0p_img <- lapply(paste0("outputs/plots/manuscript_figs_R1/hourly/", sim_preds_0p_img_files), image_read)
+
+# Combine images into a GIF
+# img_gif <- image_animate(image_join(sim_preds_0p_img), fps = 4)
+# img_gif
+
+# Save the GIF
+# image_write(img_gif, "outputs/plots/manuscript_figs_R1/sim_preds_0p_hourly.gif")
+
+```
+
+### Validation
+
+Calculating the Boyce index for each model's hourly predictions
+
+```{r}
+#| layout-ncol: 2
+
+spearman_corr_subset_0p_hour <- vector(mode = "numeric", length = nlyr(raster_0p_hourly_points_subset))
+pearson_corr_subset_0p_hour <- vector(mode = "numeric", length = nlyr(raster_0p_hourly_points_subset))
+
+for(i in 1:nlyr(raster_0p_hourly_points_subset)) {
+  
+  obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i) %>% transmute(x = x2_, y = y2_)
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_0p_hourly_points_subset[[i]], obs_data, ID = FALSE)[,1]
+  obs <- obs[!is.na(obs)]
+  # all values of the raster layer
+  abs <- terra::values(raster_0p_hourly_points_subset[[i]], na.rm = T)[,1]
+  abs <- abs[!is.na(abs)]
+  
+  boyce_index_spearman <- ecospat.boyce(abs, obs, method = "spearman", PEplot = F)
+  spearman_corr_subset_0p_hour[i] <- boyce_index_spearman$cor
+  
+  boyce_index_pearson <- ecospat.boyce(abs, obs, method = "pearson", PEplot = F)
+  pearson_corr_subset_0p_hour[i] <- boyce_index_pearson$cor
+}
+
+cat("Spearman correlation = ", spearman_corr_subset_0p_hour, "\n")
+cat("Pearson correlation = ", pearson_corr_subset_0p_hour)
+
+sp_PB_subset_0p_hour <- data.frame(hour = 1:24,
+                                   corr = "Spearman",
+                                   BI = "PB",
+                                   model = "0p",
+                                   value = spearman_corr_subset_0p_hour)
+
+pe_PB_subset_0p_hour <- data.frame(hour = 1:24,
+                                   corr = "Pearson",
+                                   BI = "PB",
+                                   model = "0p",
+                                   value = pearson_corr_subset_0p_hour)
+
+```
+
+## 1p
+
+```{r}
+
+setwd("Z:/ssa_simulations/hourly_prediction_maps/1p")
+
+# list files in the folder
+filenames_1p_hourly <- list.files(pattern = "*.tif", full.names = F)
+
+# read in as rasters
+predictions_1p_hourly <- lapply(filenames_1p_hourly, rast)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", filenames_1p_hourly)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+
+# order the layers by hour
+list_1p_hour_points_subset <- predictions_1p_hourly[order]
+
+# stack into a raster stack
+raster_1p_hourly_points_subset <- rast(list_1p_hour_points_subset)
+
+# aggregate to 50m resolution
+raster_all_points_subset <- aggregate(raster_1p_hourly_points_subset, fact = 2, fun = sum)
+
+```
+
+### Create dataframes of raster values to plot with ggplot
+
+```{r}
+
+sum(is.na(values(raster_1p_hourly_points_subset[[1]])))
+
+# raster_1p_hourly_points_subset_norm <- rast(lapply(raster_1p_hourly_points_subset, normalise_raster))
+
+# change NA values to 0
+raster_1p_hourly_points_subset <- terra::classify(raster_1p_hourly_points_subset, cbind(NA, 0))
+
+df_1p_hourly_points_subset <- lapply(raster_1p_hourly_points_subset, function(x) {
+  return(as.data.frame(x, xy = TRUE, na.rm = FALSE))
+})
+
+
+
+```
+
+### Plot using ggplot, with buffalo locations overlaid
+
+```{r}
+##| layout-ncol: 3
+
+which_plots <- c(3,7,12)
+
+max_locs <- max(sapply(1:length(df_1p_hourly_points_subset), function(x) {
+  max(df_1p_hourly_points_subset[[x]]$sum)
+}))
+
+for(i in 1:length(which_plots)) {
+  print(ggplot() +
+          geom_raster(data = df_1p_hourly_points_subset[[which_plots[i]]], aes(x = x, y = y, fill = sum)) +
+          geom_point(data = buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i), 
+                     aes(x = x2_, y = y2_), size = 0.1, col = "white", alpha = 0.5) +
+          coord_equal() +
+        scale_x_continuous("Easting") +
+          
+        scale_y_continuous("Northing") +
+          ggtitle(paste("Model 1p - Hour ", which_plots[i])) +
+          scale_fill_viridis_c(limits = c(0, max_locs)) +
+          theme_bw() +
+        theme(legend.position = "none",
+    axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+    axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+    axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+    axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+    plot.title = element_text(size = 10)))
+  
+  # loop over all hours to save the plots for the gif
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/hourly/sim_predictions_subset_1p_hour_", i, ".png"),
+  # width=80, height=75, units="mm", dpi = 600)
+  
+}
+
+```
+
+### Create a gif of the hourly predictions
+
+Uncomment the last few lines to have the gif created. We show the gif in the readme of the GitHub repo: <https://github.com/swforrest/dynamic_SSF_sims>.
+
+```{r}
+
+sim_preds_1p_img_unordered <- list.files(path = "outputs/plots/manuscript_figs_R1/hourly/",
+                                 pattern = "1p",
+                                 full.names = F)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", sim_preds_1p_img_unordered)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+sim_preds_1p_img_files <- sim_preds_1p_img_unordered[order]
+
+# read in the ordered image files into a list to convert to gif
+# sim_preds_1p_img <- lapply(paste0("outputs/plots/manuscript_figs_R1/hourly/", sim_preds_1p_img_files), image_read)
+
+# Combine images into a GIF
+# img_gif <- image_animate(image_join(sim_preds_1p_img), fps = 4)
+# img_gif
+
+# Save the GIF
+# image_write(img_gif, "outputs/plots/manuscript_figs_R1/sim_preds_1p_hourly.gif")
+
+```
+
+### Validation
+
+Calculating the Boyce index for each model's hourly predictions
+
+```{r}
+#| layout-ncol: 2
+
+spearman_corr_subset_1p_hour <- vector(mode = "numeric", length = nlyr(raster_1p_hourly_points_subset))
+pearson_corr_subset_1p_hour <- vector(mode = "numeric", length = nlyr(raster_1p_hourly_points_subset))
+
+for(i in 1:nlyr(raster_1p_hourly_points_subset)) {
+  
+  obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i) %>% transmute(x = x2_, y = y2_)
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_1p_hourly_points_subset[[i]], obs_data, ID = FALSE)[,1]
+  obs <- obs[!is.na(obs)]
+  # all values of the raster layer
+  abs <- terra::values(raster_1p_hourly_points_subset[[i]], na.rm = T)[,1]
+  abs <- abs[!is.na(abs)]
+  
+  boyce_index_spearman <- ecospat.boyce(abs, obs, method = "spearman", PEplot = F)
+  spearman_corr_subset_1p_hour[i] <- boyce_index_spearman$cor
+  
+  boyce_index_pearson <- ecospat.boyce(abs, obs, method = "pearson", PEplot = F)
+  pearson_corr_subset_1p_hour[i] <- boyce_index_pearson$cor
+}
+
+cat("Spearman correlation = ", spearman_corr_subset_1p_hour, "\n")
+cat("Pearson correlation = ", pearson_corr_subset_1p_hour)
+
+sp_PB_subset_1p_hour <- data.frame(hour = 1:24,
+                                   corr = "Spearman",
+                                   BI = "PB",
+                                   model = "1p",
+                                   value = spearman_corr_subset_1p_hour)
+
+pe_PB_subset_1p_hour <- data.frame(hour = 1:24,
+                                   corr = "Pearson",
+                                   BI = "PB",
+                                   model = "1p",
+                                   value = pearson_corr_subset_1p_hour)
+
+```
+
+## 2p
+
+```{r}
+
+setwd("Z:/ssa_simulations/hourly_prediction_maps/2p")
+
+# list files in the folder
+filenames_2p_hourly <- list.files(pattern = "*.tif", full.names = F)
+
+# read in as rasters
+predictions_2p_hourly <- lapply(filenames_2p_hourly, rast)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", filenames_2p_hourly)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+
+# order the layers by hour
+list_2p_hour_points_subset <- predictions_2p_hourly[order]
+
+# stack into a raster stack
+raster_2p_hourly_points_subset <- rast(list_2p_hour_points_subset)
+
+# aggregate to 50m resolution
+raster_all_points_subset <- aggregate(raster_2p_hourly_points_subset, fact = 2, fun = sum)
+
+```
+
+### Create dataframes of raster values to plot with ggplot
+
+```{r}
+
+sum(is.na(values(raster_2p_hourly_points_subset[[1]])))
+
+# raster_2p_hourly_points_subset_norm <- rast(lapply(raster_2p_hourly_points_subset, normalise_raster))
+
+# change NA values to 0
+raster_2p_hourly_points_subset <- terra::classify(raster_2p_hourly_points_subset, cbind(NA, 0))
+
+df_2p_hourly_points_subset <- lapply(raster_2p_hourly_points_subset, function(x) {
+  return(as.data.frame(x, xy = TRUE, na.rm = FALSE))
+})
+
+
+
+```
+
+### Plot using ggplot, with buffalo locations overlaid
+
+```{r}
+##| layout-ncol: 3
+
+which_plots <- c(3,7,12)
+
+max_locs <- max(sapply(1:length(df_2p_hourly_points_subset), function(x) {
+  max(df_2p_hourly_points_subset[[x]]$sum)
+}))
+
+for(i in 1:length(which_plots)) {
+  print(ggplot() +
+          geom_raster(data = df_2p_hourly_points_subset[[which_plots[i]]], aes(x = x, y = y, fill = sum)) +
+          geom_point(data = buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i), 
+                     aes(x = x2_, y = y2_), size = 0.1, col = "white", alpha = 0.5) +
+          coord_equal() +
+        scale_x_continuous("Easting") +
+          
+        scale_y_continuous("Northing") +
+          ggtitle(paste("Model 2p - Hour ", which_plots[i])) +
+          scale_fill_viridis_c(limits = c(0, max_locs)) +
+          theme_bw() +
+        theme(legend.position = "none",
+    axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+    axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+    axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+    axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+    plot.title = element_text(size = 10)))
+  
+  # loop over all hours to save the plots for the gif
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/hourly/sim_predictions_subset_2p_hour_", i, ".png"),
+  # width=80, height=75, units="mm", dpi = 600)
+  
+}
+
+```
+
+### Create a gif of the hourly predictions
+
+Uncomment the last few lines to have the gif created. We show the gif in the readme of the GitHub repo: <https://github.com/swforrest/dynamic_SSF_sims>.
+
+```{r}
+
+sim_preds_2p_img_unordered <- list.files(path = "outputs/plots/manuscript_figs_R1/hourly/",
+                                 pattern = "2p",
+                                 full.names = F)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", sim_preds_2p_img_unordered)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+sim_preds_2p_img_files <- sim_preds_2p_img_unordered[order]
+
+# read in the ordered image files into a list to convert to gif
+# sim_preds_2p_img <- lapply(paste0("outputs/plots/manuscript_figs_R1/hourly/", sim_preds_2p_img_files), image_read)
+
+# Combine images into a GIF
+# img_gif <- image_animate(image_join(sim_preds_2p_img), fps = 4)
+# img_gif
+
+# Save the GIF
+# image_write(img_gif, "outputs/plots/manuscript_figs_R1/sim_preds_2p_hourly.gif")
+
+```
+
+### Validation
+
+Calculating the Boyce index for each model's hourly predictions
+
+```{r}
+#| layout-ncol: 2
+
+spearman_corr_subset_2p_hour <- vector(mode = "numeric", length = nlyr(raster_2p_hourly_points_subset))
+pearson_corr_subset_2p_hour <- vector(mode = "numeric", length = nlyr(raster_2p_hourly_points_subset))
+
+for(i in 1:nlyr(raster_2p_hourly_points_subset)) {
+  
+  obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i) %>% transmute(x = x2_, y = y2_)
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_2p_hourly_points_subset[[i]], obs_data, ID = FALSE)[,1] 
+  obs <- obs[!is.na(obs)]
+  # all values of the raster layer
+  abs <- terra::values(raster_2p_hourly_points_subset[[i]], na.rm = T)[,1]
+  abs <- abs[!is.na(abs)]
+  
+  boyce_index_spearman <- ecospat.boyce(abs, obs, method = "spearman", PEplot = F)
+  spearman_corr_subset_2p_hour[i] <- boyce_index_spearman$cor
+  
+  boyce_index_pearson <- ecospat.boyce(abs, obs, method = "pearson", PEplot = F)
+  pearson_corr_subset_2p_hour[i] <- boyce_index_pearson$cor
+}
+
+cat("Spearman correlation = ", spearman_corr_subset_2p_hour, "\n")
+cat("Pearson correlation = ", pearson_corr_subset_2p_hour)
+
+sp_PB_subset_2p_hour <- data.frame(hour = 1:24,
+                                   corr = "Spearman",
+                                   BI = "PB",
+                                   model = "2p",
+                                   value = spearman_corr_subset_2p_hour)
+
+pe_PB_subset_2p_hour <- data.frame(hour = 1:24,
+                                   corr = "Pearson",
+                                   BI = "PB",
+                                   model = "2p",
+                                   value = pearson_corr_subset_2p_hour)
+
+```
+
+## 3p
+
+```{r}
+
+setwd("Z:/ssa_simulations/hourly_prediction_maps/3p")
+
+# list files in the folder
+filenames_3p_hourly <- list.files(pattern = "*.tif", full.names = F)
+
+# read in as rasters
+predictions_3p_hourly <- lapply(filenames_3p_hourly, rast)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", filenames_3p_hourly)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+
+# order the layers by hour
+list_3p_hour_points_subset <- predictions_3p_hourly[order]
+
+# stack into a raster stack
+raster_3p_hourly_points_subset <- rast(list_3p_hour_points_subset)
+
+# aggregate to 50m resolution
+raster_all_points_subset <- aggregate(raster_3p_hourly_points_subset, fact = 2, fun = sum)
+
+```
+
+### Create dataframes of raster values to plot with ggplot
+
+```{r}
+
+sum(is.na(values(raster_3p_hourly_points_subset[[1]])))
+
+# raster_3p_hourly_points_subset_norm <- rast(lapply(raster_3p_hourly_points_subset, normalise_raster))
+
+# change NA values to 0
+raster_3p_hourly_points_subset <- terra::classify(raster_3p_hourly_points_subset, cbind(NA, 0))
+
+df_3p_hourly_points_subset <- lapply(raster_3p_hourly_points_subset, function(x) {
+  return(as.data.frame(x, xy = TRUE, na.rm = FALSE))
+})
+
+```
+
+### Plot using ggplot, with buffalo locations overlaid
+
+```{r}
+##| layout-ncol: 3
+
+which_plots <- c(3,7,12)
+
+max_locs <- max(sapply(1:length(df_3p_hourly_points_subset), function(x) {
+  max(df_3p_hourly_points_subset[[x]]$sum)
+}))
+
+for(i in 1:length(which_plots)) {
+  print(ggplot() +
+          geom_raster(data = df_3p_hourly_points_subset[[which_plots[i]]], aes(x = x, y = y, fill = sum)) +
+          geom_point(data = buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i), 
+                     aes(x = x2_, y = y2_), size = 0.1, col = "white", alpha = 0.5) +
+          coord_equal() +
+        scale_x_continuous("Easting") +
+          
+        scale_y_continuous("Northing") +
+          ggtitle(paste("Model 3p - Hour ", which_plots[i])) +
+          scale_fill_viridis_c(limits = c(0, max_locs)) +
+          theme_bw() +
+        theme(legend.position = "none",
+    axis.title.x = element_text(size = 8),  # Reduce x-axis title text size
+    axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+    axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+    axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+    plot.title = element_text(size = 10)))
+  
+  # loop over all hours to save the plots for the gif
+  # ggsave(paste0("outputs/plots/manuscript_figs_R1/hourly/sim_predictions_subset_3p_hour_", i, ".png"),
+  # width=80, height=75, units="mm", dpi = 600)
+  
+}
+
+```
+
+### Create a gif of the hourly predictions
+
+Uncomment the last few lines to have the gif created. We show the gif in the readme of the GitHub repo: <https://github.com/swforrest/dynamic_SSF_sims>.
+
+```{r}
+
+sim_preds_3p_img_unordered <- list.files(path = "outputs/plots/manuscript_figs_R1/hourly/",
+                                 pattern = "3p",
+                                 full.names = F)
+
+# Use a regular expression to extract the hours from each filename
+extracted_numbers_chr <- gsub(".*hour_(\\d+).*", "\\1", sim_preds_3p_img_unordered)
+extracted_numbers <- as.integer(extracted_numbers_chr)
+order <- order(extracted_numbers)
+sim_preds_3p_img_files <- sim_preds_3p_img_unordered[order]
+
+# read in the ordered image files into a list to convert to gif
+# sim_preds_3p_img <- lapply(paste0("outputs/plots/manuscript_figs_R1/hourly/", sim_preds_3p_img_files), image_read)
+
+# Combine images into a GIF
+# img_gif <- image_animate(image_join(sim_preds_3p_img), fps = 4)
+# img_gif
+
+# Save the GIF
+# image_write(img_gif, "outputs/plots/manuscript_figs_R1/sim_preds_3p_hourly.gif")
+
+```
+
+### Validation
+
+Calculating the Boyce index for each model's hourly predictions
+
+```{r}
+#| layout-ncol: 2
+
+spearman_corr_subset_3p_hour <- vector(mode = "numeric", length = nlyr(raster_3p_hourly_points_subset))
+pearson_corr_subset_3p_hour <- vector(mode = "numeric", length = nlyr(raster_3p_hourly_points_subset))
+
+for(i in 1:nlyr(raster_3p_hourly_points_subset)) {
+  
+  obs_data <- buffalo_data_subset_dry2018 %>% filter(y == 1 & hour == i) %>% transmute(x = x2_, y = y2_)
+  
+  # observed (true) locations
+  obs <- terra::extract(raster_3p_hourly_points_subset[[i]], obs_data, ID = FALSE)[,1]
+  obs <- obs[!is.na(obs)]
+  # all values of the raster layer
+  abs <- terra::values(raster_3p_hourly_points_subset[[i]], na.rm = T)[,1]
+  abs <- abs[!is.na(abs)]
+  
+  boyce_index_spearman <- ecospat.boyce(abs, obs, method = "spearman", PEplot = F)
+  spearman_corr_subset_3p_hour[i] <- boyce_index_spearman$cor
+  
+  boyce_index_pearson <- ecospat.boyce(abs, obs, method = "pearson", PEplot = F)
+  pearson_corr_subset_3p_hour[i] <- boyce_index_pearson$cor
+}
+
+cat("Spearman correlation = ", spearman_corr_subset_3p_hour, "\n")
+cat("Pearson correlation = ", pearson_corr_subset_3p_hour)
+
+sp_PB_subset_3p_hour <- data.frame(hour = 1:24,
+                                   corr = "Spearman", 
+                                   BI = "PB",
+                                   model = "3p",
+                                   value = spearman_corr_subset_3p_hour)
+
+pe_PB_subset_3p_hour <- data.frame(hour = 1:24,
+                                   corr = "Pearson",
+                                   BI = "PB",
+                                   model = "3p",
+                                   value = pearson_corr_subset_3p_hour)
+
+```
+
+:::
+
+# Hourly validation results
+
+## Combine the results dataframes
+
+```{r}
+
+hourly_BI_results <- bind_rows(sp_PB_subset_0p_hour, 
+                               pe_PB_subset_0p_hour, 
+                                sp_PB_subset_1p_hour,
+                                pe_PB_subset_1p_hour,
+                                sp_PB_subset_2p_hour,
+                                pe_PB_subset_2p_hour,
+                                sp_PB_subset_3p_hour, 
+                                pe_PB_subset_3p_hour)
+
+# add a row for hour = 0 (which is hour = 24)
+hourly_BI_results_hour0 <- hourly_BI_results %>% group_by(corr, BI, model) %>% filter(hour == 24)
+hourly_BI_results_hour0$hour <- 0
+
+hourly_BI_results <- bind_rows(hourly_BI_results, hourly_BI_results_hour0)
+
+```
+
+## Plotting the Spearman correlation for each model for each hour
+
+```{r}
+
+ggplot(hourly_BI_results %>% filter(BI == "PB" & corr == "Spearman"),
+         aes(x = hour, y = value, col = model, fill = model, group = interaction(corr, model))) +
+  geom_smooth(linewidth = 0.75, alpha = 0.1, se = T) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model") +
+  scale_y_continuous("Spearman correlation") +
+  scale_x_continuous("Hour", limits = c(0,24), breaks = seq(0,24,6)) +
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.title.x = element_text(vjust = -2, size = 8),
+      axis.title.y = element_text(size = 8),  # Reduce y-axis title text size
+      axis.text.x = element_text(size = 5),   # Reduce x-axis text size
+      axis.text.y = element_text(size = 5),   # Reduce y-axis text size
+      plot.title = element_text(size = 10),
+      legend.text = element_text(size = 6),
+      legend.title = element_text(size = 7))
+
+# ggsave(paste0("outputs/plots/manuscript_figs_R1/sim_predictions_subset_hourly_150mm.png"),
+# width=150, height=50, units="mm", dpi = 1000)
+
+```
+
+## References
+
+<div id="refs"></div> 
+  
+## Session info
+
+```{r}
+
+sessionInfo()
+
+```
