@@ -1,0 +1,1049 @@
+---
+title: "Comparing buffalo and simulated data using summary statistics"
+author: "Anonymous"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+bibliography: references.bib
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dev = 'png',
+                      dpi = 600)
+```
+
+## Load packages
+
+```{r message = FALSE, warning = FALSE}
+
+options(scipen=999)
+
+library(tidyverse)
+packages <- c("ggh4x", "patchwork", "terra", "ggExtra", 
+              "cowplot", "ggpubr", "viridis", "scales")
+walk(packages, require, character.only = T)
+
+```
+
+## Import environmental layers
+
+```{r}
+
+# unscaled rasters
+ndvi_stack <- rast("mapping/cropped rasters/ndvi_GEE_projected_watermask20230207.tif")
+ndvi_2018_dry <- ndvi_stack[[8:10]]
+ndvi_2019_dry <- ndvi_stack[[19:21]]
+ndvi_dry <- terra::mean(c(ndvi_2018_dry, ndvi_2019_dry))
+names(ndvi_dry) <- "ndvi_dry"
+# plot(ndvi_dry)
+
+canopy <- rast("mapping/cropped rasters/canopy_cover.tif")
+herby <- rast("mapping/cropped rasters/veg_herby.tif")
+slope <- rast("mapping/cropped rasters/slope_raster.tif")
+
+```
+
+# Hourly summary statistics
+
+Import the summary statistic data frames from the observed and simulated datasets that were outputted by the trajectory validation scripts, and combine into a single data frame for plotting
+
+```{r message = FALSE}
+
+# read in the observed data
+summaries_hourly_buffalo <- 
+  read_csv("outputs/buffalo_summaries_hourly_habitat_2024-02-07.csv") %>% 
+  mutate(id = as.factor(id))
+
+# read in the simulated data
+summaries_hourly_0p <- 
+  read_csv("outputs/sim_0p_memALL_summaries_hourly_habitat_2024-02-07.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_1p <- 
+  read_csv("outputs/sim_1p_memALL_summaries_hourly_habitat_2024-02-07.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_2p <- 
+  read_csv("outputs/sim_2p_memALL_summaries_hourly_habitat_2024-02-07.csv") %>% 
+  mutate(id = as.factor(id))
+summaries_hourly_3p <- 
+  read_csv("outputs/sim_3p_memALL_summaries_hourly_habitat_2024-02-07.csv") %>% 
+  mutate(id = as.factor(id))
+
+summaries_hourly_all <- bind_rows(summaries_hourly_buffalo, 
+                                  summaries_hourly_0p, 
+                                  summaries_hourly_1p, 
+                                  summaries_hourly_2p, 
+                                  summaries_hourly_3p)
+
+summaries_hourly_all_long <- summaries_hourly_all %>% 
+  dplyr::select(!...1) %>% 
+  pivot_longer(cols = !c(data, hour, id), 
+               names_to = "variable", 
+               values_to = "value") %>% 
+  mutate(Data = factor(str_to_title(data), 
+                       levels = c("Buffalo", "0p", "1p", "2p", "3p")))
+
+head(summaries_hourly_all)
+head(summaries_hourly_all_long)
+
+```
+
+## Plot the hourly habitat selection between the observed and simulated data from different models
+
+In these plots we are assessing how well the simulated trajectories capture the movement dynamics and habitat use of the observed data.
+
+There's a few different ways we can plot this, so we'll provide some examples here.
+
+### With each hour represented as a boxplot
+
+Here, each `point' in a boxplot represents the mean value of step length for that hour for one of the trajectories (observed or simulated). Therefore, the boxplot represents the distribution of these means across all trajectories for each of the models or the observed data. We also include a smoothed line to show the trend.
+
+The boxplots get hard to interpret with the habitat covariates.
+
+```{r}
+
+# Create color mapping
+unique_groups <- unique(summaries_hourly_all_long$Data)
+colors <- viridis(length(unique_groups))
+names(colors) <- unique_groups
+colors["Buffalo"] <- "red"
+
+# Step length
+ggplot() +
+  geom_boxplot(data = summaries_hourly_all_long %>% filter(variable == "step_length_mean"), 
+               aes(x = factor(hour), y = value, colour = Data, fill = Data), 
+               alpha = 0.5,
+               outlier.shape = NA) +
+  geom_smooth(data = summaries_hourly_all_long %>% filter(variable == "step_length_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              size = 0.5,
+              se = FALSE,
+              alpha = 0.75) +
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Step length (m)") +
+  theme_classic()
+
+# NDVI
+ggplot() +
+  geom_boxplot(data = summaries_hourly_all_long %>% filter(variable == "ndvi_mean"), 
+               aes(x = factor(hour), y = value, colour = Data, fill = Data), 
+               alpha = 0.5,
+               outlier.shape = NA) +
+  geom_smooth(data = summaries_hourly_all_long %>% filter(variable == "ndvi_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              size = 0.5,
+              se = FALSE,
+              alpha = 0.75) +
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("NDVI") +
+  theme_classic()
+
+```
+
+### With a path approach
+
+Here we show a single `path' per observed or simulated individual, which is comprised of the mean step length (or other covariate) for each hour. We also include a smoothed line to show the trend. The 13 observed buffalo are shown in red, and the simulated trajectories are coloured based on the model that was fitted (0p, 1p, 2p or 3p to denote 0 - 3 pairs of harmonics).
+
+Again, these are a bit messy, but we can see every trajectory. It's clear that there is a lot of variability in both the observed and simulated data, which is likely due to where in the landscape the observed or simulated buffalo were (and what habitat is `available' to them). We can see that the dynamic models (2p and 3p for the step length, and 1p, 2p and 3p for NDVI) capture the dynamic trends in movement behaviour and habitat selection.
+
+```{r}
+
+# subset the number of simulations 
+#(650 per model in our case = 13 buffalo x 50 simulations)
+summaries_hourly_all_long_subset <- summaries_hourly_all_long %>% 
+  dplyr::group_by(data, hour, variable) %>% slice_head(n = 650)
+
+summaries_hourly_all_long_subset %>% dplyr::group_by(data, id)
+
+# set path alpha
+sim_path_alpha <- 0.1
+buff_path_alpha <- 0.25
+
+# set smooth alpha
+sim_smooth_alpha <- 1
+buff_smooth_alpha <- 1
+
+# linewidth
+sim_path_linewidth <- 0.25
+buff_path_linewidth <- 0.5
+
+# smooth linewidth
+sim_smooth_linewidth <- 1
+buff_smooth_linewidth <- 1
+
+# Step length
+ggplot() +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"), 
+             aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+             alpha = sim_path_alpha,
+            linewidth = sim_path_linewidth) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "step_length_mean"), 
+               aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+               alpha = buff_path_alpha,
+            linewidth = buff_path_linewidth) +
+  
+  geom_smooth(data = summaries_hourly_all_long %>% 
+                filter(!Data == "Buffalo" & variable == "step_length_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              method = "gam",
+              size = sim_smooth_linewidth,
+              se = FALSE,
+              alpha = sim_smooth_alpha) +
+  geom_smooth(data = summaries_hourly_all_long %>% 
+                filter(Data == "Buffalo" & variable == "step_length_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              method = "gam",
+              size = buff_smooth_linewidth,
+              se = FALSE,
+              alpha = buff_smooth_alpha) +
+  
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Step length (m)") +
+  theme_classic()
+
+
+# NDVI
+ggplot() +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"), 
+             aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+             alpha = sim_path_alpha,
+            linewidth = sim_path_linewidth) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "ndvi_mean"), 
+               aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+               alpha = buff_path_alpha,
+            linewidth = buff_path_linewidth) +
+  
+  geom_smooth(data = summaries_hourly_all_long %>% 
+                filter(!Data == "Buffalo" & variable == "ndvi_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              method = "gam",
+              size = sim_smooth_linewidth,
+              se = FALSE,
+              alpha = sim_smooth_alpha) +
+  geom_smooth(data = summaries_hourly_all_long %>% 
+                filter(Data == "Buffalo" & variable == "ndvi_mean"), 
+              aes(x = hour, y = value, colour = Data, fill = Data),
+              method = "gam",
+              size = buff_smooth_linewidth,
+              se = FALSE,
+              alpha = buff_smooth_alpha) +
+  
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("NDVI") +
+  theme_classic()
+
+
+```
+
+### A quantile ribbon approach
+
+To express the stochasticity of the simulations, here we show the 25th to 50th quantiles and the 2.5th to 97.5th quantiles of the data. Remember that the `data' are the means for each hour for each trajectory, so the quantiles are calculated across the means for each hour.
+
+This is the plotting approach that we used in the paper.
+
+Here we create a ribbon from the 25th to 50th quantiles and from the 2.5th to 97.5th quantiles of the data
+
+```{r}
+
+hourly_summary_quantiles <- summaries_hourly_all_long %>% 
+  dplyr::group_by(Data, hour, variable) %>% 
+  summarise(n = n(), 
+            mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            q025 = quantile(value, probs = 0.025, na.rm = TRUE), 
+            q25 = quantile(value, probs = 0.25, na.rm = TRUE),
+            q50 = quantile(value, probs = 0.5, na.rm = TRUE), 
+            q75 = quantile(value, probs = 0.75, na.rm = TRUE),
+            q975 = quantile(value, probs = 0.975, na.rm = TRUE))
+
+```
+
+Here we show the hourly step length and selection of three of the habitat covariates. We use a dashed-line ribbon for the 95% interval and a solid-line ribbon for the 50% interval. We show the mean as a solid line.
+
+It's quite a long plotting script...
+
+```{r}
+
+# set plotting parameters here that will change in each plot
+buff_path_alpha <- 0.1
+ribbon_95_alpha <- 0.1
+ribbon_50_alpha <- 0.15
+path_95_alpha <- 1
+
+hourly_path_sl_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "step_length_mean"),
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)),
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "step_length_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Step length (m)") +
+  theme_classic()
+
+hourly_path_sl_plot
+  
+  
+hourly_path_ndvi_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "ndvi_mean"),
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)),
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "ndvi_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) +
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("NDVI") +
+  theme_classic()
+
+hourly_path_ndvi_plot
+    
+    
+hourly_path_herby_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "herby_mean"), 
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "herby_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Herbaceous vegetation") +
+  theme_classic()
+
+hourly_path_herby_plot
+    
+    
+hourly_path_canopy_plot <- ggplot() +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+
+  geom_ribbon(data = hourly_summary_quantiles %>% 
+                filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, ymin = q25, ymax = q75, fill = Data),
+              alpha = ribbon_50_alpha) +
+  
+  geom_path(data = summaries_hourly_all_long_subset %>% 
+              filter(Data == "Buffalo" & variable == "canopy_mean"), 
+                 aes(x = hour, y = value, colour = Data, group = interaction(id, Data)), 
+                 alpha = buff_path_alpha,
+              linewidth = buff_path_linewidth) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = q025, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = q975, colour = Data),
+            linetype = "dashed",
+              alpha = path_95_alpha) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+  
+  geom_path(data = hourly_summary_quantiles %>% 
+              filter(!Data == "Buffalo" & variable == "canopy_mean"),
+              aes(x = hour, y = mean, colour = Data),
+              linewidth = 1) +
+    
+  scale_fill_manual(values = colors) + 
+  scale_colour_manual(values = colors) +
+  scale_x_discrete("Hour", breaks = seq(0,24,3)) +
+  scale_y_continuous("Mean value") +
+  ggtitle("Canopy cover") +
+  theme_classic()
+
+hourly_path_canopy_plot
+
+```
+
+Combining the hourly plots
+
+```{r}
+
+ggarrange(hourly_path_sl_plot + 
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank()), 
+          
+          hourly_path_ndvi_plot + 
+            theme(axis.title.x = element_blank(),
+                  axis.text.x = element_blank(),
+                  axis.title.y = element_blank()), 
+          
+          hourly_path_herby_plot, 
+          
+          hourly_path_canopy_plot +
+            theme(axis.title.y = element_blank()),
+          
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow = 2,
+          legend = "bottom",
+          common.legend = TRUE)
+
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_hourly_path_mean_all_", 
+              Sys.Date(), ".png"),
+       width=150, height=120, units="mm", dpi = 600)
+
+```
+
+# Full trajectory summary statistics
+
+Here we compare between the observed and simulated trajectories using summary statistics that result in a single value per trajectory (rather than one per hour as above). These summary statistics were also used by @Abrahms2017-dp and @Kays2023-zi, although to compare between taxa rather than between observed and simulated data.
+
+Import the summary statistic data frames from the observed and simulated datasets and combine into a single data frame for plotting
+
+```{r message = FALSE}
+
+summaries_buffalo <- 
+  read_csv("outputs/buffalo_summary_statistics_df_2024-02-07.csv")
+
+summaries_0p <- 
+  read_csv("outputs/sim_0p_memALL_daily_summary_statistics_df_2024-02-07.csv")
+summaries_0p <- summaries_0p %>% mutate(sim = "0p")
+
+summaries_1p <- 
+  read_csv("outputs/sim_1p_memALL_daily_summary_statistics_df_2024-02-07.csv")
+summaries_1p <- summaries_1p %>% mutate(sim = "1p")
+
+summaries_2p <- 
+  read_csv("outputs/sim_2p_memALL_daily_summary_statistics_df_2024-02-07.csv")
+summaries_2p <- summaries_2p %>% mutate(sim = "2p")
+
+summaries_3p <- 
+  read_csv("outputs/sim_3p_memALL_daily_summary_statistics_df_2024-02-07.csv")
+summaries_3p <- summaries_3p %>% mutate(sim = "3p")
+
+summaries_all <- bind_rows(summaries_buffalo, 
+                           summaries_0p, 
+                           summaries_1p, 
+                           summaries_2p, 
+                           summaries_3p)
+
+summaries_all <- summaries_all %>% mutate(residence_time_log = log(residence_time),
+                                         msd_log = log(msd))
+
+summaries_all_long <- summaries_all %>% 
+  pivot_longer(cols = !c(traj, id, data, sim), 
+               names_to = "summary", values_to = "value") %>% 
+  
+  mutate(sim = factor(sim, levels = c("obs", "0p", "1p", "2p", "3p"),
+                      labels = c("Buffalo", "0p", "1p", "2p", "3p")),
+         
+         # cateogrise the summary statistics for plotting
+         category = case_when(summary == "step_length_median" ~ "step",
+                              summary == "step_length_mean" ~ "step",
+                              summary == "gamma_shape" ~ "step",
+                              summary == "gamma_scale" ~ "step",
+                              summary == "vm_kappa" ~ "step",
+                              
+                              summary == "straightness" ~ "path",
+                              summary == "sinuosity" ~ "path",
+                              
+                              summary == "tac" ~ "life_history",
+                              summary == "cum_dist" ~ "life_history",
+                              summary == "tot_dist" ~ "life_history",
+                              summary == "msd" ~ "life_history",
+                              summary == "msd_log" ~ "life_history",
+                              summary == "intensity_use" ~ "life_history",
+                              summary == "residence_time" ~ "life_history",
+                              summary == "residence_time_log" ~ "life_history",
+                              summary == "hr_area_50" ~ "life_history",
+                              summary == "hr_area_75" ~ "life_history",
+                              summary == "hr_area_95" ~ "life_history",
+                              summary == "hr_monthly_overlap_ba" ~ "life_history",
+                              summary == "hr_monthly_overlap_vi" ~ "life_history",
+                              summary == "ba_overlap" ~ "life_history",
+                              
+                              summary == "ndvi_mean" ~ "habitat",
+                              summary == "ndvi_median" ~ "habitat",
+                              summary == "ndvi_sd" ~ "habitat",
+                              summary == "herby_mean" ~ "habitat",
+                              summary == "herby_sd" ~ "habitat",
+                              summary == "canopy_mean" ~ "habitat",
+                              summary == "canopy_sd" ~ "habitat",
+                              summary == "slope_mean" ~ "habitat",
+                              summary == "slope_median" ~ "habitat",
+                              summary == "slope_sd" ~ "habitat"
+                              
+                              ))
+
+head(summaries_all_long)
+tail(summaries_all_long)
+
+```
+
+Calculate the mean of the summary statistic values for plotting
+
+```{r}
+
+summary_mean_values <- summaries_all_long %>%
+  group_by(summary, sim) %>%
+  summarize(mean_value = mean(value, na.rm = TRUE),
+           median_value = median(value, na.rm = TRUE))
+
+summaries_all_long %>%
+  group_by(summary) %>%
+  summarise(mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE)) %>%
+  arrange(summary)
+
+```
+
+## Step measurements
+
+```{r}
+
+# Create color mapping
+unique_groups <- unique(summaries_all_long$sim)
+colors <- viridis(length(unique_groups))
+names(colors) <- unique_groups
+colors["Buffalo"] <- "red"
+
+step_summary_labs <- c("gamma_shape" = "G shape", 
+                       "gamma_scale" = "G scale", 
+                       "step_length_mean" = "Mean SL", 
+                       "step_length_median" = "Median SL", 
+                       "vm_kappa" = "vM kappa")
+
+ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "step" #&
+                          # !str_detect(summary, "gamma")
+                        ),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggh4x::facet_grid2(scales = "free", cols = vars(summary), 
+                     independent = "y", 
+                     labeller = labeller(summary = step_summary_labs)) +
+  ggtitle("Step summary statistics") +
+  scale_fill_manual("Data", values = colors) +
+  scale_y_continuous("Value") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+# save the plot using ggplot
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_summary_comparison_steps_",
+              Sys.Date(), ".png"), 
+       width=150, height=90, units="mm", dpi = 600)
+
+```
+
+## Path measurements
+
+```{r}
+
+summary_labs <- c("sinuosity" = "Sinuosity", "straightness" = "Straightness")
+
+ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "path"),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggh4x::facet_grid2(scales = "free", cols = vars(summary), independent = "y"
+                     , labeller = labeller(summary = summary_labs)
+                     ) +
+  ggtitle("Path summary statistics") +
+  scale_fill_manual("Data", values = colors) +
+  scale_y_continuous("Value") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+# save the plot using ggplot
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_summary_comparison_paths_", 
+              Sys.Date(), ".png"), 
+       width=150, height=90, units="mm", dpi = 600)
+
+```
+
+## Life-history measurements
+
+```{r}
+
+lh_summary_labs <- c("intensity_use" = "Intensity of Use", 
+                     "msd" = "MSD (m^2)", 
+                     "residence_time" = "RT (hours)", 
+                     "tac" = "Mean TAC", 
+                     "tot_dist" = "Tot Dist (m)")
+
+                     
+ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "life_history" &
+                          (str_detect(summary, "tac") |
+                             str_detect(summary, "residence_time") |
+                             str_detect(summary, "tot_d") |
+                             str_detect(summary, "intensity_use")) &
+                          !str_detect(summary, "log")),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggh4x::facet_grid2(scales = "free", cols = vars(summary), independent = "y", 
+                     labeller = labeller(summary = lh_summary_labs)) +
+  ggtitle("Life-history summary statistics") +
+  scale_fill_manual("Data", values = colors) +
+  scale_y_log10("Value") +
+  # scale_y_continuous("Value") + 
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+# save the plot using ggplot
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_summary_comparison_life_history_", 
+              Sys.Date(), ".png"), 
+       width=150, height=90, units="mm", dpi = 600)
+
+```
+
+## Home range area (KDE) and monthly overlap
+
+```{r}
+
+hr_summary_labs <- c("hr_area_50" = "KDE 50%", 
+                     "hr_area_75" = "KDE 75%", 
+                     "hr_area_95" = "KDE 95%", 
+                     "hr_monthly_overlap_ba" = "Monthly overlap")
+  
+
+kde_hr_plot <- ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "life_history" &
+                          str_detect(summary, "hr_area") &
+                          !str_detect(summary, "75")),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggh4x::facet_grid2(scales = "free", 
+                     cols = vars(summary), 
+                     # independent = "y",
+                     remove_labels = "all",
+                     labeller = labeller(summary = hr_summary_labs)
+                     ) +
+  ggtitle("KDE home range area") +
+  scale_fill_manual(values = colors) +
+  scale_y_log10(expression("Area (km"^2*")")) + 
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+kde_hr_plot
+
+
+kde_hr_overlap_plot <- ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "life_history" &
+                          str_detect(summary, "hr_monthly_overlap_ba")),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggh4x::facet_grid2(scales = "free", cols = vars(summary), independent = "y",
+                     labeller = labeller(summary = hr_summary_labs)
+                     ) +
+  ggtitle("KDE home range overlap") +
+  scale_fill_manual(values = colors) +
+  scale_y_continuous("Bhattacharyya's Affinity (BA)") + 
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+kde_hr_overlap_plot
+
+```
+
+### Combining plots
+
+```{r}
+
+ggarrange(kde_hr_plot + 
+            ggtitle("Home range area") +
+            theme(axis.title.x = element_blank()),
+          
+          kde_hr_overlap_plot + 
+            ggtitle("") +
+            theme_bw() +
+            theme(axis.title.x = element_blank(),
+                               axis.text.x = element_blank()),
+          ncol = 2, nrow = 1,
+          widths = c(2,1),
+          legend = "bottom",
+          common.legend = TRUE)
+
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_kde_overlap_", 
+              Sys.Date(), ".png"),
+       width=150, height=120, units="mm", dpi = 600)
+
+```
+
+## Habitat summary statistics comparison
+
+```{r}
+
+habitat_summaries_NOslope_plot <- ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "habitat" &
+                          str_detect(summary, "mean")) %>% 
+                 filter(!str_detect(summary, "slope")),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) + 
+  ggtitle("Habitat summary statistics") +
+  scale_fill_manual(values = colors, "") +
+  scale_x_discrete("", labels = c("Canopy cover", "Herbaceous veg", "NDVI")) +
+  scale_y_continuous("Mean value") + 
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+habitat_summaries_NOslope_plot
+
+
+habitat_summaries_slope_plot <- ggplot() +
+  geom_boxplot(data = summaries_all_long %>%
+                 filter(category == "habitat" &
+                          str_detect(summary, "mean")) %>% 
+                 filter(str_detect(summary, "slope")),
+                       aes(x = summary, y = value, fill = sim), alpha = 0.75,
+               outlier.size = 0.5) +
+  ggtitle(" ") +
+  scale_fill_manual(values = colors, "") +
+  scale_x_discrete("", labels = c("Slope")) +
+  scale_y_continuous("Mean value") + 
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+habitat_summaries_slope_plot
+
+```
+
+### Combining plots
+
+```{r}
+
+ggarrange(habitat_summaries_NOslope_plot + theme(axis.title.x = element_blank()),
+          
+          habitat_summaries_slope_plot + theme(axis.title.x = element_blank(),
+                               axis.title.y = element_blank()),
+          ncol = 2, nrow = 1,
+          widths = c(2,1),
+          align = "v",
+          legend = "bottom",
+          common.legend = TRUE)
+
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_overall_habitat_overlap_", 
+              Sys.Date(), ".png"),
+       width=150, height=120, units="mm", dpi = 600)
+
+```
+
+# PCA of summary statistics
+
+Similar to the approach of @Abrahms2017-dp and @Kays2023-zi, we can use PCA to reduce the dimensionality of the summaries and assess the differences between the observed and simulated data in the latent space.
+
+```{r}
+
+# remove some of the columns that should not be included in the PCA, such as id etc,
+# and some that are covered by another summary, such as the monthly overlap with
+# volume of intersection, as this information is largely contained in the Bhattacharyya's
+# affinity overlap
+# summaries_all_pca <- summaries_all %>%
+#   dplyr::select(-traj, -id, -data, -sim, -residence_time_log, 
+#                 -msd_log, -ba_overlap, -hr_monthly_overlap_vi) %>% 
+#   na.omit() %>% 
+#   prcomp(center = TRUE, scale. = TRUE)
+
+summaries_all_pca <- summaries_all %>%
+  dplyr::select(step_length_median,
+                step_length_mean,
+                gamma_shape,
+                gamma_scale,
+                vm_kappa,
+                sinuosity,
+                straightness,
+                intensity_use,
+                tac,
+                residence_time,
+                tot_dist,
+                hr_area_50,
+                hr_area_95,
+                hr_monthly_overlap_ba,
+                ndvi_mean,
+                ndvi_sd,
+                canopy_mean,
+                canopy_sd,
+                herby_mean,
+                herby_sd,
+                slope_mean,
+                slope_sd
+                ) %>% 
+  na.omit() %>% 
+  prcomp(center = TRUE, scale. = TRUE)
+
+# summaries_all_pca
+
+#PCA diagnostics
+summary(summaries_all_pca)
+summaries_all_pca
+biplot(summaries_all_pca)
+screeplot(summaries_all_pca, type = "l")
+
+# proportion of variance explained
+prop_var <- summaries_all_pca$sdev^2 / sum(summaries_all_pca$sdev^2)
+
+# to create of vector of the simulation labels
+# this should remove the same columns as above, besides sim
+sims <- summaries_all %>%
+  dplyr::select(-traj, -id, -data, -residence_time_log, -msd_log,
+                -ba_overlap, -hr_monthly_overlap_vi) %>%
+  na.omit() %>% 
+  pull(sim)
+
+# Create a data frame for ggplot
+pca_data <- data.frame(sim = sims, summaries_all_pca$x)
+
+# reorder levels for the legend
+pca_data$sim <- factor(pca_data$sim, levels = c("obs", "0p", "1p", "2p", "3p"), 
+                       labels = c("Buffalo", "0p", "1p", "2p", "3p"))
+
+# Biplot
+ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(data = pca_data %>% filter(sims != "obs"), 
+             aes(PC1, PC2, colour = sim), 
+             size = 1, alpha = 0.5) +
+  geom_point(data = pca_data %>% filter(sims == "obs"), 
+             aes(PC1, PC2), 
+             colour = "red") +
+  scale_colour_viridis_d("Data") +
+  ggtitle("PCA Biplot") +
+  xlab("Principal Component 1") +
+  ylab("Principal Component 2") +
+  theme_bw()
+
+```
+
+We see that the simulated and observed summaries overlap in the PCA space, and there are few differences between the simulated trajectories from different models, suggesting that the simulations are largely replicating the trends observed in the data, given our set of summary statistics.
+
+We can add a few more plotting elements for further comparison.
+
+```{r}
+
+# Function to compute convex hull and return a data frame
+get_hull_coordinates <- function(data, group) {
+  points <- data[data$sim == group,]
+  hull <- chull(points$PC1, points$PC2)
+  return(data.frame(points[hull, ]))
+}
+
+# Compute hulls for each group
+hulls <- do.call(rbind, lapply(unique(pca_data$sim), get_hull_coordinates, data = pca_data))
+
+```
+
+Add density to the x and y axes.
+
+```{r}
+
+# Generate Viridis colors for three groups
+viridis_colors <- viridis::viridis(4)
+# Create a named vector of colors for all groups
+colors <- setNames(c('red', viridis_colors), c("Buffalo", "0p", "1p", "2p", "3p"))
+
+# Biplot with polygons
+pca_plot <- ggplot() +
+  geom_point(data = pca_data, 
+             aes(PC1, PC2, color = sim), 
+             alpha = 0.5) +
+  geom_polygon(data = hulls %>% filter(sim == "Buffalo"), 
+               aes(x = PC1, y = PC2, group = sim), 
+               alpha = 0.3, fill = "red") +
+  theme_bw() +
+  ggtitle("PCA of all summary statistics") +
+  xlab(paste0("PC1: ", round(prop_var[1]*100, 1), "% expl. variance")) +
+  ylab(paste0("PC2: ", round(prop_var[2]*100, 1), "% expl. variance")) +
+  scale_color_manual("Data", values = colors) +
+  # scale_y_continuous(limits = c(-5.5, 5.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme(legend.position = "bottom")
+
+# pca_plot
+
+# Add marginal density plots
+xdens <- 
+  axis_canvas(pca_plot, axis = "x") + 
+  geom_density(data = pca_data, aes(x = PC1, fill = sim), size = 0.25, alpha = 0.25) +
+  scale_fill_manual(values = colors)
+
+ydens <-
+  axis_canvas(pca_plot, axis = "y", coord_flip = TRUE) +
+  geom_density(data = pca_data, aes(x = PC2, fill = sim), size = 0.25, alpha = 0.25) +
+  scale_fill_manual(values = colors) +
+  coord_flip()
+
+pca_plot %>%
+  insert_xaxis_grob(xdens, grid::unit(1.5, "cm"), position = "top") %>%
+  insert_yaxis_grob(ydens, grid::unit(1.5, "cm"), position = "right") %>%
+  ggdraw()
+
+# save the plot using ggplot
+ggsave(paste0("outputs/plots/manuscript_figs/memALL_PCA_all_summaries_", 
+              Sys.Date(), ".png"), 
+       width=150, height=120, units="mm", dpi = 600)
+
+```
+
+## References
+
+<div id="refs"></div> 
+  
+## Session info
+
+```{r}
+
+sessionInfo()
+
+```
