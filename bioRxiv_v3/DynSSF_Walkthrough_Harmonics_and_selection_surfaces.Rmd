@@ -1,6 +1,6 @@
 ---
 title: "Reconstructing temporally dynamic coefficients and selection surfaces using harmonics"
-author: "Anonymous"
+author: "Scott Forrest"
 date: "`r Sys.Date()`"
 output:
   html_document: default
@@ -14,6 +14,7 @@ In this script we will provide some intuition for harmonic regression, and walk 
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE,
+                      strip.white = FALSE,
                       dev = 'png',
                       dpi = 600)
 ```

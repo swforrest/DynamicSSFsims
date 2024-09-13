@@ -1,6 +1,6 @@
 ---
 title: "Previous space use density parameter estimation"
-author: "Anonymous"
+author: "Scott Forrest"
 date: "`r Sys.Date()`"
 output:
   pdf_document: default

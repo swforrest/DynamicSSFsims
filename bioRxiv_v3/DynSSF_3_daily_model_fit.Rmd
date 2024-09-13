@@ -1,6 +1,6 @@
 ---
 title: "Step selection model fitting using TwoStepCLogit"
-author: "Anonymous"
+author: "Scott Forrest"
 date: "`r Sys.Date()`"
 output:
   pdf_document: default
@@ -11,6 +11,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE,
+                      strip.white = FALSE,
                       dev = 'png',
                       dpi = 600)
 ```

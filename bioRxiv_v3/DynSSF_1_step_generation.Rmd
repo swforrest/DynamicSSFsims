@@ -1,6 +1,6 @@
 ---
 title: "Step generation for fitting water buffalo step selection models"
-author: "Anonymous"
+author: "Scott Forrest"
 date: "`r Sys.Date()`"
 output:
   pdf_document: default
