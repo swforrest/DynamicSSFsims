@@ -1,6 +1,6 @@
 # Predicting fine-scale distributions and emergent spatiotemporal patterns from temporally dynamic step selection simulations
 
-The code, data and R objects in this repository accompany a paper titled 'Predicting fine-scale distributions and emergent spatiotemporal patterns from temporally dynamic step selection simulations', which is currently available as a preprint at: [https://www.biorxiv.org/content/10.1101/2024.03.19.585696v4](https://www.biorxiv.org/content/10.1101/2024.03.19.585696v4).
+The code, data and R objects in this repository accompany a paper titled 'Predicting fine-scale distributions and emergent spatiotemporal patterns from temporally dynamic step selection simulations', which is published in Ecography with DOI: 10.1111/ecog.07421.
 
 In this paper we used harmonic terms to estimate temporally dynamic coefficients from step selection models, from which we simulated animal movement trajectories. The simulations with temporal dynamics gave informative hourly predictions of expected buffalo distribution (animations below), and also gave more accurate long-term predictions. 
 
